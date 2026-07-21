@@ -1,0 +1,16 @@
+diff --git a/apps/papra-server/src/modules/app/server.routes.test.ts b/apps/papra-server/src/modules/app/server.routes.test.ts
+index 19c83421..97d6e0ec 100644
+--- a/apps/papra-server/src/modules/app/server.routes.test.ts
++++ b/apps/papra-server/src/modules/app/server.routes.test.ts
+@@ -23,7 +23,10 @@ function setValidParams(path: string) {
+     .replaceAll(':shareLinkId', 'dsl_333333333333333333333333')
+     .replaceAll(':shareLinkToken', 't'.repeat(SHARE_LINK_TOKEN_LENGTH))
+     .replaceAll(':documentViewId', 'dv_444444444444444444444444')
+-    .replaceAll(':planEntitlementId', 'pla_ent_555555555555555555555555');
++    .replaceAll(':planEntitlementId', 'pla_ent_555555555555555555555555')
++    .replaceAll(':folderId', 'folder_666666666666666666666666')
++    .replaceAll(':destinationId', 'bkdst_777777777777777777777777')
++    .replaceAll(':runId', 'bkrun_888888888888888888888888');
+ 
+   // throw if there are any remaining params
+   if (newPath.match(/:\w+/g)) {
