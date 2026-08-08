@@ -1,4 +1,4 @@
-export const documentSearchSortFields = ['createdAt', 'updatedAt', 'name', 'documentDate'] as const;
+export const documentSearchSortFields = ['createdAt', 'updatedAt', 'name', 'documentDate', 'tags'] as const;
 export type DocumentSearchSortField = (typeof documentSearchSortFields)[number];
 
 export const documentSearchSortOrders = ['asc', 'desc'] as const;

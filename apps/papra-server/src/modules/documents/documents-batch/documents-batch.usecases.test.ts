@@ -1,4 +1,5 @@
 import type { DocumentSearchServices } from '../document-search/document-search.types';
+import { eq } from 'drizzle-orm';
 import { describe, expect, test } from 'vitest';
 import { createInMemoryDatabase } from '../../app/database/database.test-utils';
 import { createTestEventServices } from '../../app/events/events.test-utils';
@@ -6,11 +7,13 @@ import { ORGANIZATION_ROLES } from '../../organizations/organizations.constants'
 import { pick } from '../../shared/objects';
 import { createTagsRepository } from '../../tags/tags.repository';
 import { documentsTagsTable } from '../../tags/tags.table';
+import { foldersTable } from '../../folders/folders.table';
 import { createDatabaseFts5DocumentSearchServices } from '../document-search/database-fts5/database-fts5.document-search-provider';
 import { createDocumentsRepository } from '../documents.repository';
 import { documentsTable } from '../documents.table';
 import { createDocumentIdsNotFromOrganizationError } from './documents-batch.errors';
 import {
+  moveDocumentsBatch,
   resolveBatchTargetDocumentIds,
   tagDocumentsBatch,
   trashDocumentsBatch,
@@ -448,6 +451,263 @@ describe('documents-batch usecases', () => {
 
       const records = await db.select().from(documentsTable);
       expect(records.every((r) => r.isDeleted === true)).to.eql(true);
+    });
+  });
+
+  describe('moveDocumentsBatch', () => {
+    test('moves documents scoped to the organization, throws if any document does not belong to the organization', async () => {
+      const { db } = await createInMemoryDatabase({
+        users: [{ id: 'user-1', email: 'user-1@example.com' }],
+        organizations: [
+          { id: 'organization-1', name: 'Organization 1' },
+          { id: 'organization-2', name: 'Organization 2' },
+        ],
+        documents: [
+          { id: 'doc-1', ...baseDocument, name: 'doc 1', originalSha256Hash: 'h1' },
+          { id: 'doc-2', ...baseDocument, name: 'doc 2', originalSha256Hash: 'h2' },
+          {
+            id: 'doc-3',
+            organizationId: 'organization-2',
+            mimeType: 'text/plain',
+            originalStorageKey: 's3',
+            originalName: 'doc 3',
+            name: 'doc 3',
+            originalSha256Hash: 'h3',
+          },
+        ],
+      });
+      await db
+        .insert(foldersTable)
+        .values({ id: 'folder-1', organizationId: 'organization-1', name: 'Folder 1' })
+        .execute();
+
+      const documentsRepository = createDocumentsRepository({ db });
+      const { services } = createStubSearchServices();
+
+      await expect(
+        moveDocumentsBatch({
+          filter: { documentIds: ['doc-1', 'doc-3'] },
+          folderId: 'folder-1',
+          organizationId: 'organization-1',
+          userId: 'user-1',
+          documentsRepository,
+          documentSearchServices: services,
+          eventServices: createTestEventServices(),
+        }),
+      ).rejects.toThrow(createDocumentIdsNotFromOrganizationError());
+
+      const records = await db.select().from(documentsTable);
+      const byId = Object.fromEntries(records.map((r) => [r.id, pick(r, ['id', 'folderId'])]));
+      expect(byId).to.eql({
+        'doc-1': { id: 'doc-1', folderId: null },
+        'doc-2': { id: 'doc-2', folderId: null },
+        'doc-3': { id: 'doc-3', folderId: null },
+      });
+    });
+
+    test('moves the resolved documents to the given folder', async () => {
+      const { db } = await createInMemoryDatabase({
+        users: [{ id: 'user-1', email: 'user-1@example.com' }],
+        organizations: [{ id: 'organization-1', name: 'Organization 1' }],
+        documents: [
+          { id: 'doc-1', ...baseDocument, name: 'doc 1', originalSha256Hash: 'h1' },
+          { id: 'doc-2', ...baseDocument, name: 'doc 2', originalSha256Hash: 'h2' },
+        ],
+      });
+      await db
+        .insert(foldersTable)
+        .values({ id: 'folder-1', organizationId: 'organization-1', name: 'Folder 1' })
+        .execute();
+
+      const documentsRepository = createDocumentsRepository({ db });
+      const { services } = createStubSearchServices();
+
+      const { movedDocumentIds } = await moveDocumentsBatch({
+        filter: { documentIds: ['doc-1', 'doc-2'] },
+        folderId: 'folder-1',
+        organizationId: 'organization-1',
+        userId: 'user-1',
+        documentsRepository,
+        documentSearchServices: services,
+        eventServices: createTestEventServices(),
+      });
+
+      expect(movedDocumentIds).to.have.members(['doc-1', 'doc-2']);
+
+      const records = await db.select().from(documentsTable);
+      const byId = Object.fromEntries(records.map((r) => [r.id, r.folderId]));
+      expect(byId).to.eql({ 'doc-1': 'folder-1', 'doc-2': 'folder-1' });
+    });
+
+    test('moving to null moves documents back to the root', async () => {
+      const { db } = await createInMemoryDatabase({
+        users: [{ id: 'user-1', email: 'user-1@example.com' }],
+        organizations: [{ id: 'organization-1', name: 'Organization 1' }],
+        documents: [{ id: 'doc-1', ...baseDocument, name: 'doc 1', originalSha256Hash: 'h1' }],
+      });
+      await db
+        .insert(foldersTable)
+        .values({ id: 'folder-1', organizationId: 'organization-1', name: 'Folder 1' })
+        .execute();
+      await db
+        .update(documentsTable)
+        .set({ folderId: 'folder-1' })
+        .where(eq(documentsTable.id, 'doc-1'))
+        .execute();
+
+      const documentsRepository = createDocumentsRepository({ db });
+      const { services } = createStubSearchServices();
+
+      await moveDocumentsBatch({
+        filter: { documentIds: ['doc-1'] },
+        folderId: null,
+        organizationId: 'organization-1',
+        userId: 'user-1',
+        documentsRepository,
+        documentSearchServices: services,
+        eventServices: createTestEventServices(),
+      });
+
+      const records = await db.select().from(documentsTable);
+      expect(records[0]?.folderId).to.eql(null);
+    });
+
+    test('does not move documents that are in the trash', async () => {
+      const { db } = await createInMemoryDatabase({
+        users: [{ id: 'user-1', email: 'user-1@example.com' }],
+        organizations: [{ id: 'organization-1', name: 'Organization 1' }],
+        documents: [
+          {
+            id: 'doc-1',
+            ...baseDocument,
+            name: 'doc 1',
+            originalSha256Hash: 'h1',
+            isDeleted: true,
+            deletedBy: 'user-1',
+          },
+        ],
+      });
+      await db
+        .insert(foldersTable)
+        .values({ id: 'folder-1', organizationId: 'organization-1', name: 'Folder 1' })
+        .execute();
+
+      const documentsRepository = createDocumentsRepository({ db });
+      const { services } = createStubSearchServices();
+
+      const { movedDocumentIds } = await moveDocumentsBatch({
+        filter: { documentIds: ['doc-1'] },
+        folderId: 'folder-1',
+        organizationId: 'organization-1',
+        userId: 'user-1',
+        documentsRepository,
+        documentSearchServices: services,
+        eventServices: createTestEventServices(),
+      });
+
+      expect(movedDocumentIds).to.eql([]);
+      const records = await db.select().from(documentsTable);
+      expect(records[0]?.folderId).to.eql(null);
+    });
+
+    test('emits a documents.moved event with the actually moved ids', async () => {
+      const { db } = await createInMemoryDatabase({
+        users: [{ id: 'user-1', email: 'user-1@example.com' }],
+        organizations: [{ id: 'organization-1', name: 'Organization 1' }],
+        documents: [{ id: 'doc-1', ...baseDocument, name: 'doc 1', originalSha256Hash: 'h1' }],
+      });
+      await db
+        .insert(foldersTable)
+        .values({ id: 'folder-1', organizationId: 'organization-1', name: 'Folder 1' })
+        .execute();
+
+      const documentsRepository = createDocumentsRepository({ db });
+      const { services } = createStubSearchServices();
+      const eventServices = createTestEventServices();
+
+      await moveDocumentsBatch({
+        filter: { documentIds: ['doc-1'] },
+        folderId: 'folder-1',
+        organizationId: 'organization-1',
+        userId: 'user-1',
+        documentsRepository,
+        documentSearchServices: services,
+        eventServices,
+      });
+
+      expect(eventServices.getEmittedEvents()).to.eql([
+        {
+          eventName: 'documents.moved',
+          payload: {
+            documentIds: ['doc-1'],
+            organizationId: 'organization-1',
+            folderId: 'folder-1',
+            movedBy: 'user-1',
+          },
+        },
+      ]);
+    });
+
+    test('does not emit an event when no documents were moved', async () => {
+      const { db } = await createInMemoryDatabase({
+        organizations: [{ id: 'organization-1', name: 'Organization 1' }],
+      });
+      await db
+        .insert(foldersTable)
+        .values({ id: 'folder-1', organizationId: 'organization-1', name: 'Folder 1' })
+        .execute();
+
+      const documentsRepository = createDocumentsRepository({ db });
+      const { services } = createStubSearchServices({ documentIds: [] });
+      const eventServices = createTestEventServices();
+
+      const { movedDocumentIds } = await moveDocumentsBatch({
+        filter: { query: '' },
+        folderId: 'folder-1',
+        organizationId: 'organization-1',
+        userId: 'user-1',
+        documentsRepository,
+        documentSearchServices: services,
+        eventServices,
+      });
+
+      expect(movedDocumentIds).to.eql([]);
+      expect(eventServices.getEmittedEvents()).to.eql([]);
+    });
+
+    test('resolves a search query to the matching documents and moves them', async () => {
+      const { db } = await createInMemoryDatabase({
+        users: [{ id: 'user-1', email: 'user-1@example.com' }],
+        organizations: [{ id: 'organization-1', name: 'Organization 1' }],
+        documents: [
+          { id: 'doc-1', ...baseDocument, name: 'doc 1', originalSha256Hash: 'h1' },
+          { id: 'doc-2', ...baseDocument, name: 'doc 2', originalSha256Hash: 'h2' },
+        ],
+      });
+      await db
+        .insert(foldersTable)
+        .values({ id: 'folder-1', organizationId: 'organization-1', name: 'Folder 1' })
+        .execute();
+
+      const documentsRepository = createDocumentsRepository({ db });
+      const { services, calls } = createStubSearchServices({ documentIds: ['doc-1'] });
+
+      const { movedDocumentIds } = await moveDocumentsBatch({
+        filter: { query: 'tag:invoice' },
+        folderId: 'folder-1',
+        organizationId: 'organization-1',
+        userId: 'user-1',
+        documentsRepository,
+        documentSearchServices: services,
+        eventServices: createTestEventServices(),
+      });
+
+      expect(movedDocumentIds).to.eql(['doc-1']);
+      expect(calls).to.have.length(1);
+
+      const records = await db.select().from(documentsTable);
+      const byId = Object.fromEntries(records.map((r) => [r.id, r.folderId]));
+      expect(byId).to.eql({ 'doc-1': 'folder-1', 'doc-2': null });
     });
   });
 

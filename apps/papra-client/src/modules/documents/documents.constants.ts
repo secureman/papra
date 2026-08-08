@@ -18,6 +18,7 @@ export const DOCUMENT_SEARCH_SORT_FIELDS = [
   'updatedAt',
   'name',
   'documentDate',
+  'tags',
 ] as const;
 export type DocumentSearchSortField = (typeof DOCUMENT_SEARCH_SORT_FIELDS)[number];
 

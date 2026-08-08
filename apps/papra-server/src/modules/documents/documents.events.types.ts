@@ -3,6 +3,12 @@ import type { Document } from './documents.types';
 export type DocumentEvents = {
   'document.created': { document: Document };
   'documents.trashed': { documentIds: string[]; organizationId: string; trashedBy: string }; // Soft deleted by moving to trash
+  'documents.moved': {
+    documentIds: string[];
+    organizationId: string;
+    folderId: string | null;
+    movedBy: string;
+  };
   'document.restored': { documentId: string; organizationId: string; restoredBy: string };
   'document.updated': {
     userId?: string;

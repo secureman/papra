@@ -36,7 +36,8 @@ COPY packages/ ./packages/
 # Install dependencies
 # Using --ignore-scripts to avoid postinstall issues
 # Note: Using without --frozen-lockfile for now due to network/timeouts
-RUN pnpm install --frozen-lockfile
+RUN pnpm config set fetch-timeout 300000
+RUN pnpm install --filter=@papra/app-server... --frozen-lockfile --network-concurrency=4
 
 # Copy all source files
 COPY . .
@@ -82,9 +83,8 @@ COPY --from=builder --chown=nodejs:nodejs /app/pnpm-workspace.yaml ./
 # Rebuild any native modules (.node addons) against the
 # runtime image's libc to avoid SIGILL on first use
 # (e.g. @libsql/client).
-RUN pnpm rebuild
+RUN npm install -g pnpm && pnpm rebuild --filter=@papra/app-server...
 
-
 # Environment variables
 ENV NODE_ENV=production
 ENV PORT=1221

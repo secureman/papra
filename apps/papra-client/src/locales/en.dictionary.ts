@@ -367,6 +367,16 @@ export const translations = {
   'documents.list.no-documents.description':
     'There are no documents in this organization yet. Start by uploading some documents.',
   'documents.list.no-results': 'No documents found',
+
+  'documents.upload.drag-hint': 'Drag and drop files or a folder here to upload',
+  'documents.upload.drop-hint': 'Drop to upload',
+  'documents.upload.select-files': 'Select files',
+  'documents.upload.select-folder': 'Select folder',
+  'documents.upload.folder-detected':
+    'Found {{ count }} {{ count, =1:file, files }} in the folder you selected.',
+  'documents.upload.recreate-folder-structure': 'Recreate the folder structure on the server',
+  'documents.upload.cancel': 'Cancel',
+  'documents.upload.confirm-upload': 'Upload',
   'documents.list.table.headers.file-name': 'File name',
   'documents.list.table.headers.document-date': 'Date',
   'documents.list.table.headers.created': 'Created',
@@ -408,6 +418,13 @@ export const translations = {
   'documents.list.batch.tags.dialog.cancel': 'Cancel',
   'documents.list.batch.tags.success':
     'Tags updated on {{ count }} {{ count, =1:document, documents }}',
+  'documents.list.batch.move-action': 'Move',
+  'documents.list.batch.move.dialog.title': 'Move to folder',
+  'documents.list.batch.move.dialog.description':
+    'Choose a destination folder for {{ count }} selected {{ count, =1:document, documents }}.',
+  'documents.list.batch.move.dialog.submit': 'Move',
+  'documents.list.batch.move.dialog.cancel': 'Cancel',
+  'documents.list.batch.move.success': '{{ count }} {{ count, =1:document, documents }} moved',
 
   'documents.tabs.info': 'Info',
   'documents.tabs.content': 'Content',

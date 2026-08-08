@@ -6,6 +6,7 @@ import type { CustomPropertyDefinition } from './query-builder/query-builder.cus
 import { parseSearchQuery } from '@papra/search-parser';
 import { and, asc, desc, eq, sql } from 'drizzle-orm';
 import { documentsTable } from '../../documents.table';
+import { documentsTagsTable, tagsTable } from '../../../tags/tags.table';
 import { buildQueryFromExpression } from './query-builder/query-builder';
 
 export function makeSearchWhereClause({
@@ -50,6 +51,15 @@ const sortableColumnsByField: Record<DocumentSearchSortField, SQLiteColumn | SQL
   updatedAt: documentsTable.updatedAt,
   name: sql`${documentsTable.name} COLLATE NOCASE`, // case-insensitive sorting for name
   documentDate: documentsTable.documentDate,
+  // Documents can have several tags, so we sort by the alphabetically-first tag name.
+  // Untagged documents have a NULL sort value, which SQLite places first in ASC order
+  // and last in DESC order.
+  tags: sql`(
+    SELECT MIN(${tagsTable.name} COLLATE NOCASE)
+    FROM ${documentsTagsTable}
+    INNER JOIN ${tagsTable} ON ${tagsTable.id} = ${documentsTagsTable.tagId}
+    WHERE ${documentsTagsTable.documentId} = ${documentsTable.id}
+  )`,
 };
 
 export function makeSearchOrderByClauses({ sort }: { sort: DocumentSearchSort }) {

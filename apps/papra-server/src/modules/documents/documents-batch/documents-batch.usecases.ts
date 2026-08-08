@@ -127,6 +127,67 @@ export async function trashDocumentsBatch({
   };
 }
 
+export async function moveDocumentsBatch({
+  filter,
+  folderId,
+  organizationId,
+  userId,
+  documentsRepository,
+  documentSearchServices,
+  eventServices,
+  logger = createLogger({ namespace: 'documents-batch.usecases' }),
+}: {
+  filter: BatchTargetFilter;
+  folderId: string | null;
+  organizationId: string;
+  userId: string;
+  documentsRepository: DocumentsRepository;
+  documentSearchServices: DocumentSearchServices;
+  eventServices: EventServices;
+  logger?: Logger;
+}) {
+  const startTime = Date.now();
+
+  const { documentIds } = await resolveBatchTargetDocumentIds({
+    filter,
+    organizationId,
+    documentSearchServices,
+    documentsRepository,
+    logger,
+  });
+
+  const { movedDocumentIds } = await documentsRepository.moveDocuments({
+    documentIds,
+    organizationId,
+    folderId,
+  });
+
+  if (movedDocumentIds.length > 0) {
+    eventServices.emitEvent({
+      eventName: 'documents.moved',
+      payload: { documentIds: movedDocumentIds, organizationId, folderId, movedBy: userId },
+    });
+  }
+
+  logger.info(
+    {
+      organizationId,
+      userId,
+      folderId,
+      resolvedCount: documentIds.length,
+      movedCount: movedDocumentIds.length,
+      skippedCount: documentIds.length - movedDocumentIds.length,
+      durationMs: Date.now() - startTime,
+    },
+    'Executed batch document move',
+  );
+
+  return {
+    movedDocumentIds,
+    movedCount: movedDocumentIds.length,
+  };
+}
+
 export async function tagDocumentsBatch({
   filter,
   addTagIds,

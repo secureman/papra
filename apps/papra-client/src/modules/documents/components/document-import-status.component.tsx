@@ -17,8 +17,10 @@ import { invalidateOrganizationDocumentsQuery } from '../documents.composables';
 import { MAX_CONCURRENT_DOCUMENT_UPLOADS } from '../documents.constants';
 import { uploadDocument } from '../documents.services';
 
+export type UploadDocumentEntry = File | { file: File; folderId?: string | null };
+
 const DocumentUploadContext = createContext<{
-  uploadDocuments: (args: { files: File[] }) => Promise<void>;
+  uploadDocuments: (args: { files: UploadDocumentEntry[] }) => Promise<void>;
 }>();
 
 export function useDocumentUpload() {
@@ -31,7 +33,8 @@ export function useDocumentUpload() {
   const { uploadDocuments } = context;
 
   return {
-    uploadDocuments: async ({ files }: { files: File[] }) => uploadDocuments({ files }),
+    uploadDocuments: async ({ files }: { files: UploadDocumentEntry[] }) =>
+      uploadDocuments({ files }),
     promptImport: async () => {
       const { files } = await promptUploadFiles();
 
@@ -42,12 +45,14 @@ export function useDocumentUpload() {
 
 type TaskSuccess = {
   file: File;
+  folderId?: string | null;
   status: 'success';
   document: Document;
 };
 
 type TaskError = {
   file: File;
+  folderId?: string | null;
   status: 'error';
   error: Error;
 };
@@ -57,8 +62,13 @@ type Task =
   | TaskError
   | {
       file: File;
+      folderId?: string | null;
       status: 'pending' | 'uploading';
     };
+
+function normalizeUploadEntry(entry: UploadDocumentEntry): { file: File; folderId?: string | null } {
+  return entry instanceof File ? { file: entry } : entry;
+}
 
 export const DocumentUploadProvider: ParentComponent<{ organizationId: string }> = (props) => {
   const throttledInvalidateOrganizationDocumentsQuery = throttle(
@@ -88,8 +98,13 @@ export const DocumentUploadProvider: ParentComponent<{ organizationId: string }>
     refetchOnWindowFocus: false,
   }));
 
-  const uploadDocuments = async ({ files }: { files: File[] }) => {
-    setTasks((tasks) => [...tasks, ...files.map((file) => ({ file, status: 'pending' }) as const)]);
+  const uploadDocuments = async ({ files: entries }: { files: UploadDocumentEntry[] }) => {
+    const files = entries.map(normalizeUploadEntry);
+
+    setTasks((tasks) => [
+      ...tasks,
+      ...files.map(({ file, folderId }) => ({ file, folderId, status: 'pending' }) as const),
+    ]);
     setState('open');
 
     if (!organizationLimitsQuery.data) {
@@ -103,7 +118,7 @@ export const DocumentUploadProvider: ParentComponent<{ organizationId: string }>
     const limit = pLimit(MAX_CONCURRENT_DOCUMENT_UPLOADS);
 
     await Promise.all(
-      files.map(async (file) => {
+      files.map(async ({ file, folderId }) => {
         // maxUploadSize can also be null when self hosting which means no limit
         if (maxUploadSize && file.size > maxUploadSize) {
           updateTaskStatus({
@@ -118,7 +133,7 @@ export const DocumentUploadProvider: ParentComponent<{ organizationId: string }>
           updateTaskStatus({ file, status: 'uploading' });
 
           const [result, error] = await safely(
-            uploadDocument({ file, organizationId: props.organizationId }),
+            uploadDocument({ file, organizationId: props.organizationId, folderId }),
           );
 
           if (error) {

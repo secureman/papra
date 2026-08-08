@@ -1,29 +1,26 @@
 import type { DialogTriggerProps } from '@kobalte/core/dialog';
+import type { RowSelectionState } from '@tanstack/solid-table';
 import type { Component } from 'solid-js';
-import { formatBytes } from '@corentinth/chisels';
 import { A, useNavigate, useParams } from '@solidjs/router';
 import { useMutation, useQuery } from '@tanstack/solid-query';
 import { createMemo, createSignal, For, Show } from 'solid-js';
-import { getDocumentIcon } from '@/modules/documents/document.models';
-import { DocumentManagementDropdown } from '@/modules/documents/components/document-management-dropdown.component';
+import { DocumentsBatchMoveDialog } from '@/modules/documents/components/documents-batch-move-dialog.component';
+import {
+  createdAtColumn,
+  DocumentsPaginatedList,
+  standardActionsColumn,
+} from '@/modules/documents/components/documents-list.component';
+import { useFolderAwareUpload } from '@/modules/documents/composables/use-folder-aware-upload';
+import { batchMoveDocuments, batchTrashDocuments } from '@/modules/documents/documents-batch.services';
 import { invalidateOrganizationDocumentsQuery } from '@/modules/documents/documents.composables';
-import { uploadDocument } from '@/modules/documents/documents.services';
-import { RelativeTime } from '@/modules/i18n/components/RelativeTime';
 import { useI18n } from '@/modules/i18n/i18n.provider';
 import { useConfirmModal } from '@/modules/shared/confirm';
 import { useI18nApiErrors } from '@/modules/shared/http/composables/i18n-api-errors';
 import { queryClient } from '@/modules/shared/query/query-client';
 import { Button } from '@/modules/ui/components/button';
+import { Checkbox, CheckboxControl, CheckboxLabel } from '@/modules/ui/components/checkbox';
 import { EmptyState } from '@/modules/ui/components/empty';
 import { createToast } from '@/modules/ui/components/sonner';
-import {
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
-} from '@/modules/ui/components/table';
 import { buildFolderPath } from '../composables/folder-tree';
 import { CreateFolderDialog, RenameFolderDialog } from '../components/folder-dialogs.component';
 import { deleteFolder, fetchFolderContents, fetchOrganizationFolders } from '../folders.services';
@@ -145,7 +142,6 @@ export const FolderPage: Component = () => {
   const { getErrorMessage } = useI18nApiErrors({ t });
   const { confirm } = useConfirmModal();
   const [getIsCurrentFolderRenameOpen, setIsCurrentFolderRenameOpen] = createSignal(false);
-  let fileInputRef: HTMLInputElement | undefined;
 
   const currentFolderId = () => params.folderId ?? null;
 
@@ -154,6 +150,73 @@ export const FolderPage: Component = () => {
     queryFn: async () =>
       fetchFolderContents({ organizationId: params.organizationId, folderId: currentFolderId() }),
   }));
+
+  const [getDocumentRowSelection, setDocumentRowSelection] = createSignal<RowSelectionState>({});
+
+  const getSelectedDocumentIds = createMemo(() => {
+    const selection = getDocumentRowSelection();
+    return Object.keys(selection).filter((id) => selection[id]);
+  });
+
+  const clearDocumentSelection = () => setDocumentRowSelection({});
+
+  const invalidateFolderContents = async () => {
+    await Promise.all([
+      contentsQuery.refetch(),
+      invalidateOrganizationDocumentsQuery({ organizationId: params.organizationId }),
+    ]);
+  };
+
+  const batchTrashMutation = useMutation(() => ({
+    mutationFn: async () =>
+      batchTrashDocuments({
+        organizationId: params.organizationId,
+        filter: { documentIds: getSelectedDocumentIds() },
+      }),
+    onSuccess: async () => {
+      const count = getSelectedDocumentIds().length;
+      clearDocumentSelection();
+      await invalidateFolderContents();
+      createToast({ message: t('documents.list.batch.trash.success', { count }), type: 'success' });
+    },
+    onError: (error) => {
+      createToast({ message: getErrorMessage({ error }), type: 'error' });
+    },
+  }));
+
+  const [getMoveDialogOpen, setMoveDialogOpen] = createSignal(false);
+
+  const batchMoveMutation = useMutation(() => ({
+    mutationFn: async ({ folderId }: { folderId: string | null }) =>
+      batchMoveDocuments({
+        organizationId: params.organizationId,
+        filter: { documentIds: getSelectedDocumentIds() },
+        folderId,
+      }),
+    onSuccess: async () => {
+      const count = getSelectedDocumentIds().length;
+      clearDocumentSelection();
+      await invalidateFolderContents();
+      createToast({ message: t('documents.list.batch.move.success', { count }), type: 'success' });
+    },
+    onError: (error) => {
+      createToast({ message: getErrorMessage({ error }), type: 'error' });
+    },
+  }));
+
+  const handleBatchTrash = async () => {
+    const count = getSelectedDocumentIds().length;
+    const confirmed = await confirm({
+      title: t('documents.list.batch.trash.confirm.title'),
+      message: t('documents.list.batch.trash.confirm.description', { count }),
+      confirmButton: { text: t('documents.list.batch.trash.confirm.label'), variant: 'destructive' },
+      cancelButton: { text: t('documents.list.batch.trash.confirm.cancel') },
+    });
+    if (!confirmed) {
+      return;
+    }
+    batchTrashMutation.mutate();
+  };
 
   // Flat list is cheap (capped per-org) and lets us build the breadcrumb path
   // client-side without one request per ancestor.
@@ -228,36 +291,73 @@ export const FolderPage: Component = () => {
     }
   };
 
-  const uploadMutation = useMutation(() => ({
-    mutationFn: async (file: File) =>
-      uploadDocument({
-        file,
-        organizationId: params.organizationId,
-        folderId: currentFolderId(),
+  const refreshAfterUpload = async () => {
+    await Promise.all([
+      contentsQuery.refetch(),
+      invalidateOrganizationDocumentsQuery({ organizationId: params.organizationId }),
+      queryClient.invalidateQueries({
+        queryKey: ['organizations', params.organizationId, 'folders'],
+        refetchType: 'all',
       }),
-    onSuccess: async () => {
-      await Promise.all([
-        contentsQuery.refetch(),
-        invalidateOrganizationDocumentsQuery({ organizationId: params.organizationId }),
-        queryClient.invalidateQueries({
-          queryKey: ['organizations', params.organizationId, 'folders'],
-          refetchType: 'all',
-        }),
-      ]);
-      createToast({ message: t('folders.upload.success'), type: 'success' });
-    },
-    onError: (error) => {
-      createToast({ message: getErrorMessage({ error }), type: 'error' });
-    },
-  }));
+    ]);
+  };
 
-  const handleFileSelected = (event: Event) => {
-    const input = event.currentTarget as HTMLInputElement;
-    const file = input.files?.[0];
-    if (file) {
-      void uploadMutation.mutateAsync(file);
+  const {
+    hasPendingFolderConfirmation,
+    getPendingFileCount,
+    getRecreateFolderStructure,
+    setRecreateFolderStructure,
+    cancelPendingUpload,
+    confirmPendingUpload,
+    promptFiles,
+    promptFolder,
+    handleDrop,
+  } = useFolderAwareUpload({
+    organizationId: params.organizationId,
+    rootFolderId: currentFolderId,
+  });
+
+  const [isDraggingOverFolder, setIsDraggingOverFolder] = createSignal(false);
+
+  const handleUploadFiles = async () => {
+    try {
+      await promptFiles();
+      await refreshAfterUpload();
+    } catch (error) {
+      createToast({ message: getErrorMessage({ error }), type: 'error' });
     }
-    input.value = '';
+  };
+
+  const handleUploadFolder = async () => {
+    try {
+      await promptFolder();
+      await refreshAfterUpload();
+    } catch (error) {
+      createToast({ message: getErrorMessage({ error }), type: 'error' });
+    }
+  };
+
+  const handleConfirmPendingUpload = async () => {
+    try {
+      await confirmPendingUpload();
+      await refreshAfterUpload();
+    } catch (error) {
+      createToast({ message: getErrorMessage({ error }), type: 'error' });
+    }
+  };
+
+  const handleFolderDrop = async (event: DragEvent) => {
+    event.preventDefault();
+    setIsDraggingOverFolder(false);
+    if (!event.dataTransfer) {
+      return;
+    }
+    try {
+      await handleDrop(event.dataTransfer);
+      await refreshAfterUpload();
+    } catch (error) {
+      createToast({ message: getErrorMessage({ error }), type: 'error' });
+    }
   };
 
   const getIsEmpty = () =>
@@ -265,7 +365,44 @@ export const FolderPage: Component = () => {
     (contentsQuery.data?.documents.length ?? 0) === 0;
 
   return (
-    <div class="p-6 mt-4 pb-32 mx-auto max-w-5xl">
+    <div
+      class="p-6 mt-4 pb-32 mx-auto max-w-5xl relative"
+      classList={{ 'outline outline-2 outline-primary outline-dashed rounded-lg': isDraggingOverFolder() }}
+      onDragOver={(event) => {
+        event.preventDefault();
+        setIsDraggingOverFolder(true);
+      }}
+      onDragLeave={() => setIsDraggingOverFolder(false)}
+      onDrop={handleFolderDrop}
+    >
+      <Show when={hasPendingFolderConfirmation()}>
+        <div class="border rounded-lg p-4 mb-4 flex flex-col gap-3 bg-background">
+          <p class="text-sm">
+            {t('documents.upload.folder-detected', { count: getPendingFileCount() })}
+          </p>
+
+          <Checkbox
+            checked={getRecreateFolderStructure()}
+            onChange={setRecreateFolderStructure}
+            class="flex items-center gap-2"
+          >
+            <CheckboxControl />
+            <CheckboxLabel class="text-sm cursor-pointer">
+              {t('documents.upload.recreate-folder-structure')}
+            </CheckboxLabel>
+          </Checkbox>
+
+          <div class="flex justify-end gap-2">
+            <Button variant="ghost" size="sm" onClick={cancelPendingUpload}>
+              {t('documents.upload.cancel')}
+            </Button>
+            <Button size="sm" onClick={handleConfirmPendingUpload}>
+              {t('documents.upload.confirm-upload')}
+            </Button>
+          </div>
+        </div>
+      </Show>
+
       <div class="flex justify-between sm:items-center pb-6 gap-4 flex-col sm:flex-row">
         <div class="flex items-center gap-1 flex-wrap text-sm">
           <A
@@ -305,16 +442,22 @@ export const FolderPage: Component = () => {
             )}
           </CreateFolderDialog>
 
-          <input
-            ref={(el) => (fileInputRef = el)}
-            type="file"
-            class="hidden"
-            onChange={handleFileSelected}
-          />
-          <Button onClick={() => fileInputRef?.click()} isLoading={uploadMutation.isPending}>
-            <div class="i-tabler-upload size-4 mr-2" />
-            {t('folders.upload-here')}
-          </Button>
+          <DropdownMenu>
+            <DropdownMenuTrigger as={Button}>
+              <div class="i-tabler-upload size-4 mr-2" />
+              {t('folders.upload-here')}
+            </DropdownMenuTrigger>
+            <DropdownMenuContent class="w-48">
+              <DropdownMenuItem class="cursor-pointer" onClick={handleUploadFiles}>
+                <div class="i-tabler-file-upload size-4 mr-2" />
+                <span>{t('documents.upload.select-files')}</span>
+              </DropdownMenuItem>
+              <DropdownMenuItem class="cursor-pointer" onClick={handleUploadFolder}>
+                <div class="i-tabler-folder-up size-4 mr-2" />
+                <span>{t('documents.upload.select-folder')}</span>
+              </DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
 
           <Show when={currentFolderId()}>
             <DropdownMenu>
@@ -376,44 +519,72 @@ export const FolderPage: Component = () => {
             </Show>
 
             <Show when={getData().documents.length > 0}>
-              <Table>
-                <TableHeader>
-                  <TableRow>
-                    <TableHead>{t('folders.table.headers.name')}</TableHead>
-                    <TableHead>{t('folders.table.headers.size')}</TableHead>
-                    <TableHead>{t('folders.table.headers.created')}</TableHead>
-                    <TableHead />
-                  </TableRow>
-                </TableHeader>
-                <TableBody>
-                  <For each={getData().documents}>
-                    {(document) => (
-                      <TableRow>
-                        <TableCell>
-                          <A
-                            href={`/organizations/${params.organizationId}/documents/${document.id}`}
-                            class="flex items-center gap-2 hover:underline"
-                          >
-                            <div
-                              class={`${getDocumentIcon({ document })} size-5 text-primary flex-shrink-0`}
-                            />
-                            <span class="truncate">{document.name}</span>
-                          </A>
-                        </TableCell>
-                        <TableCell class="text-muted-foreground">
-                          {formatBytes({ bytes: document.originalSize, base: 1000 })}
-                        </TableCell>
-                        <TableCell class="text-muted-foreground">
-                          <RelativeTime date={document.createdAt} />
-                        </TableCell>
-                        <TableCell class="text-right">
-                          <DocumentManagementDropdown document={document} />
-                        </TableCell>
-                      </TableRow>
-                    )}
-                  </For>
-                </TableBody>
-              </Table>
+              <Show when={getSelectedDocumentIds().length > 0}>
+                <div class="flex items-center gap-2 mb-3 p-2 border rounded-lg bg-muted/40">
+                  <span class="text-sm text-muted-foreground pl-2">
+                    {t('documents.list.batch.selected-count', {
+                      count: getSelectedDocumentIds().length,
+                    })}
+                  </span>
+
+                  <div class="flex-1" />
+
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => setMoveDialogOpen(true)}
+                    disabled={batchTrashMutation.isPending || batchMoveMutation.isPending}
+                  >
+                    <div class="i-tabler-folder-symlink size-4 mr-2" />
+                    {t('documents.list.batch.move-action')}
+                  </Button>
+
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={handleBatchTrash}
+                    isLoading={batchTrashMutation.isPending}
+                    disabled={batchMoveMutation.isPending}
+                    class="text-red-500 hover:text-red-600"
+                  >
+                    <div class="i-tabler-trash size-4 mr-2" />
+                    {t('documents.list.batch.trash-action')}
+                  </Button>
+
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    class="size-8"
+                    onClick={clearDocumentSelection}
+                    disabled={batchTrashMutation.isPending || batchMoveMutation.isPending}
+                    aria-label={t('documents.list.batch.clear')}
+                  >
+                    <div class="i-tabler-x size-4" />
+                  </Button>
+                </div>
+              </Show>
+
+              <DocumentsPaginatedList
+                documents={getData().documents}
+                documentsCount={getData().documents.length}
+                enableBatchSelection
+                getRowSelection={getDocumentRowSelection}
+                setRowSelection={setDocumentRowSelection}
+                showPagination={false}
+                extraColumns={[createdAtColumn, standardActionsColumn]}
+              />
+
+              <DocumentsBatchMoveDialog
+                open={getMoveDialogOpen()}
+                onOpenChange={setMoveDialogOpen}
+                organizationId={params.organizationId}
+                selectionCount={getSelectedDocumentIds().length}
+                isPending={batchMoveMutation.isPending}
+                onSubmit={({ folderId }) => {
+                  setMoveDialogOpen(false);
+                  batchMoveMutation.mutate({ folderId });
+                }}
+              />
             </Show>
           </Show>
         )}

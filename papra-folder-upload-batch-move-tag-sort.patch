@@ -1,0 +1,1876 @@
+diff --git a/apps/papra-client/src/locales/en.dictionary.ts b/apps/papra-client/src/locales/en.dictionary.ts
+index 571d1df..709e514 100644
+--- a/apps/papra-client/src/locales/en.dictionary.ts
++++ b/apps/papra-client/src/locales/en.dictionary.ts
+@@ -367,6 +367,16 @@ export const translations = {
+   'documents.list.no-documents.description':
+     'There are no documents in this organization yet. Start by uploading some documents.',
+   'documents.list.no-results': 'No documents found',
++
++  'documents.upload.drag-hint': 'Drag and drop files or a folder here to upload',
++  'documents.upload.drop-hint': 'Drop to upload',
++  'documents.upload.select-files': 'Select files',
++  'documents.upload.select-folder': 'Select folder',
++  'documents.upload.folder-detected':
++    'Found {{ count }} {{ count, =1:file, files }} in the folder you selected.',
++  'documents.upload.recreate-folder-structure': 'Recreate the folder structure on the server',
++  'documents.upload.cancel': 'Cancel',
++  'documents.upload.confirm-upload': 'Upload',
+   'documents.list.table.headers.file-name': 'File name',
+   'documents.list.table.headers.document-date': 'Date',
+   'documents.list.table.headers.created': 'Created',
+@@ -408,6 +418,13 @@ export const translations = {
+   'documents.list.batch.tags.dialog.cancel': 'Cancel',
+   'documents.list.batch.tags.success':
+     'Tags updated on {{ count }} {{ count, =1:document, documents }}',
++  'documents.list.batch.move-action': 'Move',
++  'documents.list.batch.move.dialog.title': 'Move to folder',
++  'documents.list.batch.move.dialog.description':
++    'Choose a destination folder for {{ count }} selected {{ count, =1:document, documents }}.',
++  'documents.list.batch.move.dialog.submit': 'Move',
++  'documents.list.batch.move.dialog.cancel': 'Cancel',
++  'documents.list.batch.move.success': '{{ count }} {{ count, =1:document, documents }} moved',
+ 
+   'documents.tabs.info': 'Info',
+   'documents.tabs.content': 'Content',
+diff --git a/apps/papra-client/src/modules/documents/components/document-import-status.component.tsx b/apps/papra-client/src/modules/documents/components/document-import-status.component.tsx
+index 8145f54..95603d8 100644
+--- a/apps/papra-client/src/modules/documents/components/document-import-status.component.tsx
++++ b/apps/papra-client/src/modules/documents/components/document-import-status.component.tsx
+@@ -17,8 +17,10 @@ import { invalidateOrganizationDocumentsQuery } from '../documents.composables';
+ import { MAX_CONCURRENT_DOCUMENT_UPLOADS } from '../documents.constants';
+ import { uploadDocument } from '../documents.services';
+ 
++export type UploadDocumentEntry = File | { file: File; folderId?: string | null };
++
+ const DocumentUploadContext = createContext<{
+-  uploadDocuments: (args: { files: File[] }) => Promise<void>;
++  uploadDocuments: (args: { files: UploadDocumentEntry[] }) => Promise<void>;
+ }>();
+ 
+ export function useDocumentUpload() {
+@@ -31,7 +33,8 @@ export function useDocumentUpload() {
+   const { uploadDocuments } = context;
+ 
+   return {
+-    uploadDocuments: async ({ files }: { files: File[] }) => uploadDocuments({ files }),
++    uploadDocuments: async ({ files }: { files: UploadDocumentEntry[] }) =>
++      uploadDocuments({ files }),
+     promptImport: async () => {
+       const { files } = await promptUploadFiles();
+ 
+@@ -42,12 +45,14 @@ export function useDocumentUpload() {
+ 
+ type TaskSuccess = {
+   file: File;
++  folderId?: string | null;
+   status: 'success';
+   document: Document;
+ };
+ 
+ type TaskError = {
+   file: File;
++  folderId?: string | null;
+   status: 'error';
+   error: Error;
+ };
+@@ -57,9 +62,14 @@ type Task =
+   | TaskError
+   | {
+       file: File;
++      folderId?: string | null;
+       status: 'pending' | 'uploading';
+     };
+ 
++function normalizeUploadEntry(entry: UploadDocumentEntry): { file: File; folderId?: string | null } {
++  return entry instanceof File ? { file: entry } : entry;
++}
++
+ export const DocumentUploadProvider: ParentComponent<{ organizationId: string }> = (props) => {
+   const throttledInvalidateOrganizationDocumentsQuery = throttle(
+     invalidateOrganizationDocumentsQuery,
+@@ -88,8 +98,13 @@ export const DocumentUploadProvider: ParentComponent<{ organizationId: string }>
+     refetchOnWindowFocus: false,
+   }));
+ 
+-  const uploadDocuments = async ({ files }: { files: File[] }) => {
+-    setTasks((tasks) => [...tasks, ...files.map((file) => ({ file, status: 'pending' }) as const)]);
++  const uploadDocuments = async ({ files: entries }: { files: UploadDocumentEntry[] }) => {
++    const files = entries.map(normalizeUploadEntry);
++
++    setTasks((tasks) => [
++      ...tasks,
++      ...files.map(({ file, folderId }) => ({ file, folderId, status: 'pending' }) as const),
++    ]);
+     setState('open');
+ 
+     if (!organizationLimitsQuery.data) {
+@@ -103,7 +118,7 @@ export const DocumentUploadProvider: ParentComponent<{ organizationId: string }>
+     const limit = pLimit(MAX_CONCURRENT_DOCUMENT_UPLOADS);
+ 
+     await Promise.all(
+-      files.map(async (file) => {
++      files.map(async ({ file, folderId }) => {
+         // maxUploadSize can also be null when self hosting which means no limit
+         if (maxUploadSize && file.size > maxUploadSize) {
+           updateTaskStatus({
+@@ -118,7 +133,7 @@ export const DocumentUploadProvider: ParentComponent<{ organizationId: string }>
+           updateTaskStatus({ file, status: 'uploading' });
+ 
+           const [result, error] = await safely(
+-            uploadDocument({ file, organizationId: props.organizationId }),
++            uploadDocument({ file, organizationId: props.organizationId, folderId }),
+           );
+ 
+           if (error) {
+diff --git a/apps/papra-client/src/modules/documents/components/document-upload-area.component.tsx b/apps/papra-client/src/modules/documents/components/document-upload-area.component.tsx
+index c1b6df2..debe771 100644
+--- a/apps/papra-client/src/modules/documents/components/document-upload-area.component.tsx
++++ b/apps/papra-client/src/modules/documents/components/document-upload-area.component.tsx
+@@ -1,13 +1,32 @@
+ import type { Component } from 'solid-js';
+-import { createSignal } from 'solid-js';
++import { createSignal, Show } from 'solid-js';
++import { useI18n } from '@/modules/i18n/i18n.provider';
+ import { cn } from '@/modules/shared/style/cn';
+ import { Button } from '@/modules/ui/components/button';
++import { Checkbox, CheckboxControl, CheckboxLabel } from '@/modules/ui/components/checkbox';
++import { useFolderAwareUpload } from '../composables/use-folder-aware-upload';
+ import { useDocumentUpload } from './document-import-status.component';
+ 
+-export const DocumentUploadArea: Component = () => {
++export const DocumentUploadArea: Component<{ organizationId: string; folderId?: string | null }> = (
++  props,
++) => {
++  const { t } = useI18n();
+   const [isDragging, setIsDragging] = createSignal(false);
++  const { promptImport } = useDocumentUpload();
+ 
+-  const { promptImport, uploadDocuments } = useDocumentUpload();
++  const {
++    hasPendingFolderConfirmation,
++    getPendingFileCount,
++    getRecreateFolderStructure,
++    setRecreateFolderStructure,
++    cancelPendingUpload,
++    confirmPendingUpload,
++    promptFolder,
++    handleDrop,
++  } = useFolderAwareUpload({
++    organizationId: props.organizationId,
++    rootFolderId: () => props.folderId ?? null,
++  });
+ 
+   const handleDragOver = (event: DragEvent) => {
+     event.preventDefault();
+@@ -18,34 +37,69 @@ export const DocumentUploadArea: Component = () => {
+     setIsDragging(false);
+   };
+ 
+-  const handleDrop = async (event: DragEvent) => {
++  const handleDropEvent = async (event: DragEvent) => {
+     event.preventDefault();
+     setIsDragging(false);
+-    if (!event.dataTransfer?.files) {
++    if (!event.dataTransfer) {
+       return;
+     }
+-
+-    const files = [...event.dataTransfer.files].filter((file) => file.type === 'application/pdf');
+-    await uploadDocuments({ files });
++    await handleDrop(event.dataTransfer);
+   };
+ 
+   return (
+-    <div
+-      class={cn(
+-        'border border-[2px] border-dashed text-muted-foreground rounded-lg p-6 sm:py-16 flex flex-col items-center justify-center text-center',
+-        { 'border-primary': isDragging() },
+-      )}
+-      onDragOver={handleDragOver}
+-      onDragLeave={handleDragLeave}
+-      onDrop={handleDrop}
+-    >
+-      <div class="i-tabler-cloud-upload size-12 mb-4" />
+-      <p>{isDragging() ? 'Drop files to upload' : 'Drag and drop files here to upload'}</p>
+-
+-      <Button class="mt-4" variant="outline" onClick={promptImport}>
+-        <div class="i-tabler-upload mr-2" />
+-        Select files
+-      </Button>
++    <div>
++      <div
++        class={cn(
++          'border border-[2px] border-dashed text-muted-foreground rounded-lg p-6 sm:py-16 flex flex-col items-center justify-center text-center',
++          { 'border-primary': isDragging() },
++        )}
++        onDragOver={handleDragOver}
++        onDragLeave={handleDragLeave}
++        onDrop={handleDropEvent}
++      >
++        <div class="i-tabler-cloud-upload size-12 mb-4" />
++        <p>{isDragging() ? t('documents.upload.drop-hint') : t('documents.upload.drag-hint')}</p>
++
++        <div class="flex items-center gap-2 mt-4">
++          <Button variant="outline" onClick={promptImport}>
++            <div class="i-tabler-upload mr-2" />
++            {t('documents.upload.select-files')}
++          </Button>
++
++          <Button variant="outline" onClick={promptFolder}>
++            <div class="i-tabler-folder-up mr-2" />
++            {t('documents.upload.select-folder')}
++          </Button>
++        </div>
++      </div>
++
++      <Show when={hasPendingFolderConfirmation()}>
++        <div class="border rounded-lg p-4 mt-4 flex flex-col gap-3">
++          <p class="text-sm">
++            {t('documents.upload.folder-detected', { count: getPendingFileCount() })}
++          </p>
++
++          <Checkbox
++            checked={getRecreateFolderStructure()}
++            onChange={setRecreateFolderStructure}
++            class="flex items-center gap-2"
++          >
++            <CheckboxControl />
++            <CheckboxLabel class="text-sm cursor-pointer">
++              {t('documents.upload.recreate-folder-structure')}
++            </CheckboxLabel>
++          </Checkbox>
++
++          <div class="flex justify-end gap-2">
++            <Button variant="ghost" size="sm" onClick={cancelPendingUpload}>
++              {t('documents.upload.cancel')}
++            </Button>
++            <Button size="sm" onClick={confirmPendingUpload}>
++              {t('documents.upload.confirm-upload')}
++            </Button>
++          </div>
++        </div>
++      </Show>
+     </div>
+   );
+ };
+diff --git a/apps/papra-client/src/modules/documents/components/documents-batch-move-dialog.component.tsx b/apps/papra-client/src/modules/documents/components/documents-batch-move-dialog.component.tsx
+new file mode 100644
+index 0000000..f900bd5
+--- /dev/null
++++ b/apps/papra-client/src/modules/documents/components/documents-batch-move-dialog.component.tsx
+@@ -0,0 +1,114 @@
++import type { Component } from 'solid-js';
++import { useQuery } from '@tanstack/solid-query';
++import { createEffect, createMemo, createSignal, on, Show } from 'solid-js';
++import { useI18n } from '@/modules/i18n/i18n.provider';
++import { buildIndentedFolderList } from '@/modules/folders/composables/folder-tree';
++import { fetchOrganizationFolders } from '@/modules/folders/folders.services';
++import type { Folder } from '@/modules/folders/folders.types';
++import { Button } from '@/modules/ui/components/button';
++import {
++  Dialog,
++  DialogContent,
++  DialogDescription,
++  DialogFooter,
++  DialogHeader,
++  DialogTitle,
++} from '@/modules/ui/components/dialog';
++import {
++  Select,
++  SelectContent,
++  SelectItem,
++  SelectTrigger,
++  SelectValue,
++} from '@/modules/ui/components/select';
++
++type FolderOption = { id: string | null; label: string };
++
++export const DocumentsBatchMoveDialog: Component<{
++  open: boolean;
++  onOpenChange: (open: boolean) => void;
++  organizationId: string;
++  selectionCount: number;
++  isPending?: boolean;
++  onSubmit: (args: { folderId: string | null }) => void;
++}> = (props) => {
++  const { t } = useI18n();
++  const [getFolderId, setFolderId] = createSignal<string | null>(null);
++
++  const foldersQuery = useQuery(() => ({
++    queryKey: ['organizations', props.organizationId, 'folders'],
++    queryFn: async () => fetchOrganizationFolders({ organizationId: props.organizationId }),
++  }));
++
++  const getOptions = createMemo<FolderOption[]>(() => {
++    const folders = foldersQuery.data?.folders ?? [];
++    const { indentedFolders } = buildIndentedFolderList({ folders });
++
++    return [
++      { id: null, label: t('folders.root-label') },
++      ...indentedFolders.map(({ folder, depth }: { folder: Folder; depth: number }) => ({
++        id: folder.id,
++        label: `${'— '.repeat(depth)}${folder.name}`,
++      })),
++    ];
++  });
++
++  createEffect(
++    on(
++      () => props.open,
++      () => setFolderId(null),
++    ),
++  );
++
++  function handleSubmit() {
++    props.onSubmit({ folderId: getFolderId() });
++  }
++
++  return (
++    <Dialog open={props.open} onOpenChange={props.onOpenChange}>
++      <DialogContent class="sm:max-w-[480px]">
++        <DialogHeader>
++          <DialogTitle>{t('documents.list.batch.move.dialog.title')}</DialogTitle>
++          <DialogDescription>
++            {t('documents.list.batch.move.dialog.description', { count: props.selectionCount })}
++          </DialogDescription>
++        </DialogHeader>
++
++        <Show when={props.open}>
++          <Select<FolderOption>
++            options={getOptions()}
++            optionValue="id"
++            optionTextValue="label"
++            value={getOptions().find((option) => option.id === getFolderId())}
++            onChange={(value) => setFolderId(value ? value.id : null)}
++            itemComponent={(itemProps) => (
++              <SelectItem class="cursor-pointer" item={itemProps.item}>
++                {itemProps.item.rawValue.label}
++              </SelectItem>
++            )}
++          >
++            <SelectTrigger>
++              <SelectValue<FolderOption>>{(state) => state.selectedOption()?.label}</SelectValue>
++            </SelectTrigger>
++            <SelectContent />
++          </Select>
++        </Show>
++
++        <DialogFooter>
++          <div class="flex gap-2 justify-end flex-col-reverse sm:flex-row">
++            <Button
++              variant="secondary"
++              onClick={() => props.onOpenChange(false)}
++              disabled={props.isPending}
++            >
++              {t('documents.list.batch.move.dialog.cancel')}
++            </Button>
++            <Button onClick={handleSubmit} disabled={props.isPending} isLoading={props.isPending}>
++              {t('documents.list.batch.move.dialog.submit')}
++            </Button>
++          </div>
++        </DialogFooter>
++      </DialogContent>
++    </Dialog>
++  );
++};
+diff --git a/apps/papra-client/src/modules/documents/components/documents-list.component.tsx b/apps/papra-client/src/modules/documents/components/documents-list.component.tsx
+index 9df0964..a813c95 100644
+--- a/apps/papra-client/src/modules/documents/components/documents-list.component.tsx
++++ b/apps/papra-client/src/modules/documents/components/documents-list.component.tsx
+@@ -141,7 +141,7 @@ export const tagsColumn: ColumnDef<Document> = {
+     return <span class="hidden sm:block">{t('documents.list.table.headers.tags')}</span>;
+   },
+   accessorKey: 'tags',
+-  enableSorting: false,
++  enableSorting: true,
+   cell: (data) => (
+     <DocumentTagsList
+       tags={data.getValue<Tag[]>()}
+diff --git a/apps/papra-client/src/modules/documents/composables/use-folder-aware-upload.ts b/apps/papra-client/src/modules/documents/composables/use-folder-aware-upload.ts
+new file mode 100644
+index 0000000..4c91c3f
+--- /dev/null
++++ b/apps/papra-client/src/modules/documents/composables/use-folder-aware-upload.ts
+@@ -0,0 +1,100 @@
++import type { UploadableFile } from '@/modules/shared/files/upload';
++import { createSignal } from 'solid-js';
++import {
++  containsFolderStructure,
++  getFilesFromDataTransfer,
++  promptUploadFiles,
++  promptUploadFolder,
++} from '@/modules/shared/files/upload';
++import { resolveUploadFolderStructure } from '@/modules/folders/composables/resolve-upload-folder-structure';
++import { useDocumentUpload } from '../components/document-import-status.component';
++
++// Shared by any upload entry point (drop zone, "select folder" button, etc.) that needs to:
++// - accept a folder (drag-and-drop or a folder picker),
++// - ask the person whether the folder structure should be recreated as real folders,
++// - resolve/create those folders once, and
++// - kick off the upload with the right folderId attached to each file.
++export function useFolderAwareUpload({
++  organizationId,
++  rootFolderId,
++}: {
++  organizationId: string;
++  rootFolderId: () => string | null;
++}) {
++  const { uploadDocuments } = useDocumentUpload();
++  const [getRecreateFolderStructure, setRecreateFolderStructure] = createSignal(true);
++  const [getPendingFiles, setPendingFiles] = createSignal<UploadableFile[] | null>(null);
++
++  const uploadResolvedFiles = async ({
++    files,
++    recreateFolderStructure,
++  }: {
++    files: UploadableFile[];
++    recreateFolderStructure: boolean;
++  }) => {
++    if (!recreateFolderStructure || !containsFolderStructure(files)) {
++      await uploadDocuments({
++        files: files.map(({ file }) => ({ file, folderId: rootFolderId() })),
++      });
++      return;
++    }
++
++    const directoryPaths = files
++      .map(({ relativePath }) => relativePath.split('/').slice(0, -1).join('/'))
++      .filter((path) => path.length > 0);
++
++    const { folderIdsByPath } = await resolveUploadFolderStructure({
++      organizationId,
++      directoryPaths,
++      rootFolderId: rootFolderId(),
++    });
++
++    await uploadDocuments({
++      files: files.map(({ file, relativePath }) => {
++        const directoryPath = relativePath.split('/').slice(0, -1).join('/');
++        const folderId = directoryPath
++          ? (folderIdsByPath.get(directoryPath) ?? rootFolderId())
++          : rootFolderId();
++        return { file, folderId };
++      }),
++    });
++  };
++
++  const startUpload = async (files: UploadableFile[]) => {
++    if (containsFolderStructure(files)) {
++      // Ask whether to recreate the folder structure before creating anything.
++      setPendingFiles(files);
++      return;
++    }
++
++    await uploadResolvedFiles({ files, recreateFolderStructure: false });
++  };
++
++  return {
++    hasPendingFolderConfirmation: () => getPendingFiles() !== null,
++    getPendingFileCount: () => getPendingFiles()?.length ?? 0,
++    getRecreateFolderStructure,
++    setRecreateFolderStructure,
++    cancelPendingUpload: () => setPendingFiles(null),
++    confirmPendingUpload: async () => {
++      const files = getPendingFiles();
++      if (!files) {
++        return;
++      }
++      setPendingFiles(null);
++      await uploadResolvedFiles({ files, recreateFolderStructure: getRecreateFolderStructure() });
++    },
++    promptFiles: async () => {
++      const { files } = await promptUploadFiles();
++      await startUpload(files.map((file) => ({ file, relativePath: '' })));
++    },
++    promptFolder: async () => {
++      const { files } = await promptUploadFolder();
++      await startUpload(files);
++    },
++    handleDrop: async (dataTransfer: DataTransfer) => {
++      const { files } = await getFilesFromDataTransfer(dataTransfer);
++      await startUpload(files);
++    },
++  };
++}
+diff --git a/apps/papra-client/src/modules/documents/documents-batch.services.ts b/apps/papra-client/src/modules/documents/documents-batch.services.ts
+index a8568fd..bf76f9c 100644
+--- a/apps/papra-client/src/modules/documents/documents-batch.services.ts
++++ b/apps/papra-client/src/modules/documents/documents-batch.services.ts
+@@ -33,3 +33,19 @@ export async function batchUpdateDocumentTags({
+     body: { filter, addTagIds, removeTagIds },
+   });
+ }
++
++export async function batchMoveDocuments({
++  organizationId,
++  filter,
++  folderId,
++}: {
++  organizationId: string;
++  filter: BatchTargetFilter;
++  folderId: string | null;
++}) {
++  await apiClient({
++    method: 'POST',
++    path: `/api/organizations/${organizationId}/documents/batch/move`,
++    body: { filter, folderId },
++  });
++}
+diff --git a/apps/papra-client/src/modules/documents/documents.constants.ts b/apps/papra-client/src/modules/documents/documents.constants.ts
+index ae9a3d8..909afb7 100644
+--- a/apps/papra-client/src/modules/documents/documents.constants.ts
++++ b/apps/papra-client/src/modules/documents/documents.constants.ts
+@@ -18,6 +18,7 @@ export const DOCUMENT_SEARCH_SORT_FIELDS = [
+   'updatedAt',
+   'name',
+   'documentDate',
++  'tags',
+ ] as const;
+ export type DocumentSearchSortField = (typeof DOCUMENT_SEARCH_SORT_FIELDS)[number];
+ 
+diff --git a/apps/papra-client/src/modules/documents/pages/documents.page.tsx b/apps/papra-client/src/modules/documents/pages/documents.page.tsx
+index a568072..e757826 100644
+--- a/apps/papra-client/src/modules/documents/pages/documents.page.tsx
++++ b/apps/papra-client/src/modules/documents/pages/documents.page.tsx
+@@ -18,6 +18,7 @@ import { Button } from '@/modules/ui/components/button';
+ import { createToast } from '@/modules/ui/components/sonner';
+ import { TextField, TextFieldRoot } from '@/modules/ui/components/textfield';
+ import { DocumentUploadArea } from '../components/document-upload-area.component';
++import { DocumentsBatchMoveDialog } from '../components/documents-batch-move-dialog.component';
+ import { DocumentsBatchTagDialog } from '../components/documents-batch-tag-dialog.component';
+ import {
+   createdAtColumn,
+@@ -26,7 +27,7 @@ import {
+   standardActionsColumn,
+   tagsColumn,
+ } from '../components/documents-list.component';
+-import { batchTrashDocuments, batchUpdateDocumentTags } from '../documents-batch.services';
++import { batchMoveDocuments, batchTrashDocuments, batchUpdateDocumentTags } from '../documents-batch.services';
+ import {
+   DEFAULT_DOCUMENT_SEARCH_SORT_FIELD,
+   DEFAULT_DOCUMENT_SEARCH_SORT_ORDER,
+@@ -48,6 +49,7 @@ export const DocumentsPage: Component = () => {
+   const [getRowSelection, setRowSelection] = createSignal<RowSelectionState>({});
+   const [getSelectAllMatchingQuery, setSelectAllMatchingQuery] = createSignal(false);
+   const [getTagDialogOpen, setTagDialogOpen] = createSignal(false);
++  const [getMoveDialogOpen, setMoveDialogOpen] = createSignal(false);
+ 
+   const [getSortField, setSortField] = createParamSynchronizedSignal<DocumentSearchSortField>({
+     paramKey: 'sortField',
+@@ -235,6 +237,35 @@ export const DocumentsPage: Component = () => {
+     },
+   }));
+ 
++  const moveMutation = useMutation(() => ({
++    mutationFn: async ({ folderId }: { folderId: string | null }) => {
++      const filter = getBatchFilter();
++      if (!filter) {
++        return;
++      }
++      await batchMoveDocuments({
++        organizationId: params.organizationId,
++        filter,
++        folderId,
++      });
++    },
++    onSuccess: () => {
++      const count = getEffectiveCount();
++      invalidateDocuments();
++      clearSelection();
++      createToast({
++        message: t('documents.list.batch.move.success', { count }),
++        type: 'success',
++      });
++    },
++    onError: () => {
++      createToast({
++        message: t('documents.list.batch.error'),
++        type: 'error',
++      });
++    },
++  }));
++
+   const showToolbar = () => getSelectedIds().length > 0 || getSelectAllMatchingQuery();
+ 
+   async function handleBatchTrash() {
+@@ -266,7 +297,7 @@ export const DocumentsPage: Component = () => {
+               {t('documents.list.no-documents.description')}
+             </p>
+ 
+-            <DocumentUploadArea />
++            <DocumentUploadArea organizationId={params.organizationId} />
+           </>
+         ) : (
+           <>
+@@ -388,18 +419,28 @@ export const DocumentsPage: Component = () => {
+                       variant="outline"
+                       size="sm"
+                       onClick={() => setTagDialogOpen(true)}
+-                      disabled={tagMutation.isPending || trashMutation.isPending}
++                      disabled={tagMutation.isPending || trashMutation.isPending || moveMutation.isPending}
+                     >
+                       <div class="i-tabler-tag size-4 mr-2" />
+                       {t('documents.list.batch.tag-action')}
+                     </Button>
+ 
++                    <Button
++                      variant="outline"
++                      size="sm"
++                      onClick={() => setMoveDialogOpen(true)}
++                      disabled={tagMutation.isPending || trashMutation.isPending || moveMutation.isPending}
++                    >
++                      <div class="i-tabler-folder-symlink size-4 mr-2" />
++                      {t('documents.list.batch.move-action')}
++                    </Button>
++
+                     <Button
+                       variant="outline"
+                       size="sm"
+                       onClick={handleBatchTrash}
+                       isLoading={trashMutation.isPending}
+-                      disabled={tagMutation.isPending}
++                      disabled={tagMutation.isPending || moveMutation.isPending}
+                       class="text-red-500 hover:text-red-600"
+                     >
+                       <div class="i-tabler-trash size-4 mr-2" />
+@@ -411,7 +452,7 @@ export const DocumentsPage: Component = () => {
+                       size="icon"
+                       class="size-8"
+                       onClick={clearSelection}
+-                      disabled={tagMutation.isPending || trashMutation.isPending}
++                      disabled={tagMutation.isPending || trashMutation.isPending || moveMutation.isPending}
+                       aria-label={t('documents.list.batch.clear')}
+                     >
+                       <div class="i-tabler-x size-4" />
+@@ -458,6 +499,18 @@ export const DocumentsPage: Component = () => {
+                 tagMutation.mutate({ addTagIds, removeTagIds });
+               }}
+             />
++
++            <DocumentsBatchMoveDialog
++              open={getMoveDialogOpen()}
++              onOpenChange={setMoveDialogOpen}
++              organizationId={params.organizationId}
++              selectionCount={getEffectiveCount()}
++              isPending={moveMutation.isPending}
++              onSubmit={({ folderId }) => {
++                setMoveDialogOpen(false);
++                moveMutation.mutate({ folderId });
++              }}
++            />
+           </>
+         )}
+       </Suspense>
+diff --git a/apps/papra-client/src/modules/folders/composables/resolve-upload-folder-structure.ts b/apps/papra-client/src/modules/folders/composables/resolve-upload-folder-structure.ts
+new file mode 100644
+index 0000000..79a9555
+--- /dev/null
++++ b/apps/papra-client/src/modules/folders/composables/resolve-upload-folder-structure.ts
+@@ -0,0 +1,67 @@
++import type { Folder } from '../folders.types';
++import { createFolder, fetchOrganizationFolders } from '../folders.services';
++
++// Given a set of directory paths like "invoices/2024/scans", finds or creates the
++// matching nested folders on the server (reusing existing folders where names already
++// match) and returns a map from directory path -> folderId, so callers can attach
++// each uploaded file to the right destination folder.
++export async function resolveUploadFolderStructure({
++  organizationId,
++  directoryPaths,
++  rootFolderId = null,
++}: {
++  organizationId: string;
++  directoryPaths: string[];
++  rootFolderId?: string | null;
++}): Promise<{ folderIdsByPath: Map<string, string> }> {
++  const { folders: existingFolders } = await fetchOrganizationFolders({ organizationId });
++
++  // Key: `${parentId ?? 'root'}::${normalized name}` -> folder, so we can reuse a folder
++  // that already exists with the same name under the same parent instead of creating a duplicate.
++  const byParentAndName = new Map<string, Folder>();
++  for (const folder of existingFolders) {
++    byParentAndName.set(makeKey(folder.parentId, folder.name), folder);
++  }
++
++  const folderIdsByPath = new Map<string, string>();
++
++  // Sort so parent directories are always resolved before their children.
++  const sortedPaths = [...new Set(directoryPaths)].sort(
++    (a, b) => a.split('/').length - b.split('/').length,
++  );
++
++  for (const path of sortedPaths) {
++    const segments = path.split('/').filter(Boolean);
++    let parentId = rootFolderId;
++    let currentPath = '';
++
++    for (const segment of segments) {
++      currentPath = currentPath ? `${currentPath}/${segment}` : segment;
++
++      const cached = folderIdsByPath.get(currentPath);
++      if (cached) {
++        parentId = cached;
++        continue;
++      }
++
++      const existing = byParentAndName.get(makeKey(parentId, segment));
++
++      if (existing) {
++        folderIdsByPath.set(currentPath, existing.id);
++        parentId = existing.id;
++        continue;
++      }
++
++      const { folder } = await createFolder({ organizationId, name: segment, parentId });
++      byParentAndName.set(makeKey(parentId, segment), folder);
++      folderIdsByPath.set(currentPath, folder.id);
++      parentId = folder.id;
++    }
++  }
++
++  return { folderIdsByPath };
++}
++
++function makeKey(parentId: string | null, name: string) {
++  return `${parentId ?? 'root'}::${name.trim().toLowerCase()}`;
++}
+diff --git a/apps/papra-client/src/modules/folders/pages/folder.page.tsx b/apps/papra-client/src/modules/folders/pages/folder.page.tsx
+index c6cfe05..238c66a 100644
+--- a/apps/papra-client/src/modules/folders/pages/folder.page.tsx
++++ b/apps/papra-client/src/modules/folders/pages/folder.page.tsx
+@@ -1,29 +1,26 @@
+ import type { DialogTriggerProps } from '@kobalte/core/dialog';
++import type { RowSelectionState } from '@tanstack/solid-table';
+ import type { Component } from 'solid-js';
+-import { formatBytes } from '@corentinth/chisels';
+ import { A, useNavigate, useParams } from '@solidjs/router';
+ import { useMutation, useQuery } from '@tanstack/solid-query';
+ import { createMemo, createSignal, For, Show } from 'solid-js';
+-import { getDocumentIcon } from '@/modules/documents/document.models';
+-import { DocumentManagementDropdown } from '@/modules/documents/components/document-management-dropdown.component';
++import { DocumentsBatchMoveDialog } from '@/modules/documents/components/documents-batch-move-dialog.component';
++import {
++  createdAtColumn,
++  DocumentsPaginatedList,
++  standardActionsColumn,
++} from '@/modules/documents/components/documents-list.component';
++import { useFolderAwareUpload } from '@/modules/documents/composables/use-folder-aware-upload';
++import { batchMoveDocuments, batchTrashDocuments } from '@/modules/documents/documents-batch.services';
+ import { invalidateOrganizationDocumentsQuery } from '@/modules/documents/documents.composables';
+-import { uploadDocument } from '@/modules/documents/documents.services';
+-import { RelativeTime } from '@/modules/i18n/components/RelativeTime';
+ import { useI18n } from '@/modules/i18n/i18n.provider';
+ import { useConfirmModal } from '@/modules/shared/confirm';
+ import { useI18nApiErrors } from '@/modules/shared/http/composables/i18n-api-errors';
+ import { queryClient } from '@/modules/shared/query/query-client';
+ import { Button } from '@/modules/ui/components/button';
++import { Checkbox, CheckboxControl, CheckboxLabel } from '@/modules/ui/components/checkbox';
+ import { EmptyState } from '@/modules/ui/components/empty';
+ import { createToast } from '@/modules/ui/components/sonner';
+-import {
+-  Table,
+-  TableBody,
+-  TableCell,
+-  TableHead,
+-  TableHeader,
+-  TableRow,
+-} from '@/modules/ui/components/table';
+ import { buildFolderPath } from '../composables/folder-tree';
+ import { CreateFolderDialog, RenameFolderDialog } from '../components/folder-dialogs.component';
+ import { deleteFolder, fetchFolderContents, fetchOrganizationFolders } from '../folders.services';
+@@ -145,7 +142,6 @@ export const FolderPage: Component = () => {
+   const { getErrorMessage } = useI18nApiErrors({ t });
+   const { confirm } = useConfirmModal();
+   const [getIsCurrentFolderRenameOpen, setIsCurrentFolderRenameOpen] = createSignal(false);
+-  let fileInputRef: HTMLInputElement | undefined;
+ 
+   const currentFolderId = () => params.folderId ?? null;
+ 
+@@ -155,6 +151,73 @@ export const FolderPage: Component = () => {
+       fetchFolderContents({ organizationId: params.organizationId, folderId: currentFolderId() }),
+   }));
+ 
++  const [getDocumentRowSelection, setDocumentRowSelection] = createSignal<RowSelectionState>({});
++
++  const getSelectedDocumentIds = createMemo(() => {
++    const selection = getDocumentRowSelection();
++    return Object.keys(selection).filter((id) => selection[id]);
++  });
++
++  const clearDocumentSelection = () => setDocumentRowSelection({});
++
++  const invalidateFolderContents = async () => {
++    await Promise.all([
++      contentsQuery.refetch(),
++      invalidateOrganizationDocumentsQuery({ organizationId: params.organizationId }),
++    ]);
++  };
++
++  const batchTrashMutation = useMutation(() => ({
++    mutationFn: async () =>
++      batchTrashDocuments({
++        organizationId: params.organizationId,
++        filter: { documentIds: getSelectedDocumentIds() },
++      }),
++    onSuccess: async () => {
++      const count = getSelectedDocumentIds().length;
++      clearDocumentSelection();
++      await invalidateFolderContents();
++      createToast({ message: t('documents.list.batch.trash.success', { count }), type: 'success' });
++    },
++    onError: (error) => {
++      createToast({ message: getErrorMessage({ error }), type: 'error' });
++    },
++  }));
++
++  const [getMoveDialogOpen, setMoveDialogOpen] = createSignal(false);
++
++  const batchMoveMutation = useMutation(() => ({
++    mutationFn: async ({ folderId }: { folderId: string | null }) =>
++      batchMoveDocuments({
++        organizationId: params.organizationId,
++        filter: { documentIds: getSelectedDocumentIds() },
++        folderId,
++      }),
++    onSuccess: async () => {
++      const count = getSelectedDocumentIds().length;
++      clearDocumentSelection();
++      await invalidateFolderContents();
++      createToast({ message: t('documents.list.batch.move.success', { count }), type: 'success' });
++    },
++    onError: (error) => {
++      createToast({ message: getErrorMessage({ error }), type: 'error' });
++    },
++  }));
++
++  const handleBatchTrash = async () => {
++    const count = getSelectedDocumentIds().length;
++    const confirmed = await confirm({
++      title: t('documents.list.batch.trash.confirm.title'),
++      message: t('documents.list.batch.trash.confirm.description', { count }),
++      confirmButton: { text: t('documents.list.batch.trash.confirm.label'), variant: 'destructive' },
++      cancelButton: { text: t('documents.list.batch.trash.confirm.cancel') },
++    });
++    if (!confirmed) {
++      return;
++    }
++    batchTrashMutation.mutate();
++  };
++
+   // Flat list is cheap (capped per-org) and lets us build the breadcrumb path
+   // client-side without one request per ancestor.
+   const allFoldersQuery = useQuery(() => ({
+@@ -228,36 +291,73 @@ export const FolderPage: Component = () => {
+     }
+   };
+ 
+-  const uploadMutation = useMutation(() => ({
+-    mutationFn: async (file: File) =>
+-      uploadDocument({
+-        file,
+-        organizationId: params.organizationId,
+-        folderId: currentFolderId(),
++  const refreshAfterUpload = async () => {
++    await Promise.all([
++      contentsQuery.refetch(),
++      invalidateOrganizationDocumentsQuery({ organizationId: params.organizationId }),
++      queryClient.invalidateQueries({
++        queryKey: ['organizations', params.organizationId, 'folders'],
++        refetchType: 'all',
+       }),
+-    onSuccess: async () => {
+-      await Promise.all([
+-        contentsQuery.refetch(),
+-        invalidateOrganizationDocumentsQuery({ organizationId: params.organizationId }),
+-        queryClient.invalidateQueries({
+-          queryKey: ['organizations', params.organizationId, 'folders'],
+-          refetchType: 'all',
+-        }),
+-      ]);
+-      createToast({ message: t('folders.upload.success'), type: 'success' });
+-    },
+-    onError: (error) => {
++    ]);
++  };
++
++  const {
++    hasPendingFolderConfirmation,
++    getPendingFileCount,
++    getRecreateFolderStructure,
++    setRecreateFolderStructure,
++    cancelPendingUpload,
++    confirmPendingUpload,
++    promptFiles,
++    promptFolder,
++    handleDrop,
++  } = useFolderAwareUpload({
++    organizationId: params.organizationId,
++    rootFolderId: currentFolderId,
++  });
++
++  const [isDraggingOverFolder, setIsDraggingOverFolder] = createSignal(false);
++
++  const handleUploadFiles = async () => {
++    try {
++      await promptFiles();
++      await refreshAfterUpload();
++    } catch (error) {
+       createToast({ message: getErrorMessage({ error }), type: 'error' });
+-    },
+-  }));
++    }
++  };
++
++  const handleUploadFolder = async () => {
++    try {
++      await promptFolder();
++      await refreshAfterUpload();
++    } catch (error) {
++      createToast({ message: getErrorMessage({ error }), type: 'error' });
++    }
++  };
+ 
+-  const handleFileSelected = (event: Event) => {
+-    const input = event.currentTarget as HTMLInputElement;
+-    const file = input.files?.[0];
+-    if (file) {
+-      void uploadMutation.mutateAsync(file);
++  const handleConfirmPendingUpload = async () => {
++    try {
++      await confirmPendingUpload();
++      await refreshAfterUpload();
++    } catch (error) {
++      createToast({ message: getErrorMessage({ error }), type: 'error' });
++    }
++  };
++
++  const handleFolderDrop = async (event: DragEvent) => {
++    event.preventDefault();
++    setIsDraggingOverFolder(false);
++    if (!event.dataTransfer) {
++      return;
++    }
++    try {
++      await handleDrop(event.dataTransfer);
++      await refreshAfterUpload();
++    } catch (error) {
++      createToast({ message: getErrorMessage({ error }), type: 'error' });
+     }
+-    input.value = '';
+   };
+ 
+   const getIsEmpty = () =>
+@@ -265,7 +365,44 @@ export const FolderPage: Component = () => {
+     (contentsQuery.data?.documents.length ?? 0) === 0;
+ 
+   return (
+-    <div class="p-6 mt-4 pb-32 mx-auto max-w-5xl">
++    <div
++      class="p-6 mt-4 pb-32 mx-auto max-w-5xl relative"
++      classList={{ 'outline outline-2 outline-primary outline-dashed rounded-lg': isDraggingOverFolder() }}
++      onDragOver={(event) => {
++        event.preventDefault();
++        setIsDraggingOverFolder(true);
++      }}
++      onDragLeave={() => setIsDraggingOverFolder(false)}
++      onDrop={handleFolderDrop}
++    >
++      <Show when={hasPendingFolderConfirmation()}>
++        <div class="border rounded-lg p-4 mb-4 flex flex-col gap-3 bg-background">
++          <p class="text-sm">
++            {t('documents.upload.folder-detected', { count: getPendingFileCount() })}
++          </p>
++
++          <Checkbox
++            checked={getRecreateFolderStructure()}
++            onChange={setRecreateFolderStructure}
++            class="flex items-center gap-2"
++          >
++            <CheckboxControl />
++            <CheckboxLabel class="text-sm cursor-pointer">
++              {t('documents.upload.recreate-folder-structure')}
++            </CheckboxLabel>
++          </Checkbox>
++
++          <div class="flex justify-end gap-2">
++            <Button variant="ghost" size="sm" onClick={cancelPendingUpload}>
++              {t('documents.upload.cancel')}
++            </Button>
++            <Button size="sm" onClick={handleConfirmPendingUpload}>
++              {t('documents.upload.confirm-upload')}
++            </Button>
++          </div>
++        </div>
++      </Show>
++
+       <div class="flex justify-between sm:items-center pb-6 gap-4 flex-col sm:flex-row">
+         <div class="flex items-center gap-1 flex-wrap text-sm">
+           <A
+@@ -305,16 +442,22 @@ export const FolderPage: Component = () => {
+             )}
+           </CreateFolderDialog>
+ 
+-          <input
+-            ref={(el) => (fileInputRef = el)}
+-            type="file"
+-            class="hidden"
+-            onChange={handleFileSelected}
+-          />
+-          <Button onClick={() => fileInputRef?.click()} isLoading={uploadMutation.isPending}>
+-            <div class="i-tabler-upload size-4 mr-2" />
+-            {t('folders.upload-here')}
+-          </Button>
++          <DropdownMenu>
++            <DropdownMenuTrigger as={Button}>
++              <div class="i-tabler-upload size-4 mr-2" />
++              {t('folders.upload-here')}
++            </DropdownMenuTrigger>
++            <DropdownMenuContent class="w-48">
++              <DropdownMenuItem class="cursor-pointer" onClick={handleUploadFiles}>
++                <div class="i-tabler-file-upload size-4 mr-2" />
++                <span>{t('documents.upload.select-files')}</span>
++              </DropdownMenuItem>
++              <DropdownMenuItem class="cursor-pointer" onClick={handleUploadFolder}>
++                <div class="i-tabler-folder-up size-4 mr-2" />
++                <span>{t('documents.upload.select-folder')}</span>
++              </DropdownMenuItem>
++            </DropdownMenuContent>
++          </DropdownMenu>
+ 
+           <Show when={currentFolderId()}>
+             <DropdownMenu>
+@@ -376,44 +519,72 @@ export const FolderPage: Component = () => {
+             </Show>
+ 
+             <Show when={getData().documents.length > 0}>
+-              <Table>
+-                <TableHeader>
+-                  <TableRow>
+-                    <TableHead>{t('folders.table.headers.name')}</TableHead>
+-                    <TableHead>{t('folders.table.headers.size')}</TableHead>
+-                    <TableHead>{t('folders.table.headers.created')}</TableHead>
+-                    <TableHead />
+-                  </TableRow>
+-                </TableHeader>
+-                <TableBody>
+-                  <For each={getData().documents}>
+-                    {(document) => (
+-                      <TableRow>
+-                        <TableCell>
+-                          <A
+-                            href={`/organizations/${params.organizationId}/documents/${document.id}`}
+-                            class="flex items-center gap-2 hover:underline"
+-                          >
+-                            <div
+-                              class={`${getDocumentIcon({ document })} size-5 text-primary flex-shrink-0`}
+-                            />
+-                            <span class="truncate">{document.name}</span>
+-                          </A>
+-                        </TableCell>
+-                        <TableCell class="text-muted-foreground">
+-                          {formatBytes({ bytes: document.originalSize, base: 1000 })}
+-                        </TableCell>
+-                        <TableCell class="text-muted-foreground">
+-                          <RelativeTime date={document.createdAt} />
+-                        </TableCell>
+-                        <TableCell class="text-right">
+-                          <DocumentManagementDropdown document={document} />
+-                        </TableCell>
+-                      </TableRow>
+-                    )}
+-                  </For>
+-                </TableBody>
+-              </Table>
++              <Show when={getSelectedDocumentIds().length > 0}>
++                <div class="flex items-center gap-2 mb-3 p-2 border rounded-lg bg-muted/40">
++                  <span class="text-sm text-muted-foreground pl-2">
++                    {t('documents.list.batch.selected-count', {
++                      count: getSelectedDocumentIds().length,
++                    })}
++                  </span>
++
++                  <div class="flex-1" />
++
++                  <Button
++                    variant="outline"
++                    size="sm"
++                    onClick={() => setMoveDialogOpen(true)}
++                    disabled={batchTrashMutation.isPending || batchMoveMutation.isPending}
++                  >
++                    <div class="i-tabler-folder-symlink size-4 mr-2" />
++                    {t('documents.list.batch.move-action')}
++                  </Button>
++
++                  <Button
++                    variant="outline"
++                    size="sm"
++                    onClick={handleBatchTrash}
++                    isLoading={batchTrashMutation.isPending}
++                    disabled={batchMoveMutation.isPending}
++                    class="text-red-500 hover:text-red-600"
++                  >
++                    <div class="i-tabler-trash size-4 mr-2" />
++                    {t('documents.list.batch.trash-action')}
++                  </Button>
++
++                  <Button
++                    variant="ghost"
++                    size="icon"
++                    class="size-8"
++                    onClick={clearDocumentSelection}
++                    disabled={batchTrashMutation.isPending || batchMoveMutation.isPending}
++                    aria-label={t('documents.list.batch.clear')}
++                  >
++                    <div class="i-tabler-x size-4" />
++                  </Button>
++                </div>
++              </Show>
++
++              <DocumentsPaginatedList
++                documents={getData().documents}
++                documentsCount={getData().documents.length}
++                enableBatchSelection
++                getRowSelection={getDocumentRowSelection}
++                setRowSelection={setDocumentRowSelection}
++                showPagination={false}
++                extraColumns={[createdAtColumn, standardActionsColumn]}
++              />
++
++              <DocumentsBatchMoveDialog
++                open={getMoveDialogOpen()}
++                onOpenChange={setMoveDialogOpen}
++                organizationId={params.organizationId}
++                selectionCount={getSelectedDocumentIds().length}
++                isPending={batchMoveMutation.isPending}
++                onSubmit={({ folderId }) => {
++                  setMoveDialogOpen(false);
++                  batchMoveMutation.mutate({ folderId });
++                }}
++              />
+             </Show>
+           </Show>
+         )}
+diff --git a/apps/papra-client/src/modules/organizations/pages/organization.page.tsx b/apps/papra-client/src/modules/organizations/pages/organization.page.tsx
+index c246d5f..25f558b 100644
+--- a/apps/papra-client/src/modules/organizations/pages/organization.page.tsx
++++ b/apps/papra-client/src/modules/organizations/pages/organization.page.tsx
+@@ -56,7 +56,7 @@ export const OrganizationPage: Component = () => {
+               {t('organizations.details.no-documents.description')}
+             </p>
+ 
+-            <DocumentUploadArea />
++            <DocumentUploadArea organizationId={params.organizationId} />
+           </>
+         ) : (
+           <>
+diff --git a/apps/papra-client/src/modules/shared/files/upload.ts b/apps/papra-client/src/modules/shared/files/upload.ts
+index 923fd39..de5b112 100644
+--- a/apps/papra-client/src/modules/shared/files/upload.ts
++++ b/apps/papra-client/src/modules/shared/files/upload.ts
+@@ -1,3 +1,10 @@
++export type UploadableFile = {
++  file: File;
++  // Path of the file relative to the folder the user picked/dropped, e.g. "invoices/2024/jan.pdf".
++  // Empty string when the file wasn't part of a folder selection.
++  relativePath: string;
++};
++
+ export async function promptUploadFiles({
+   acceptedTypes,
+ }: {
+@@ -19,3 +26,112 @@ export async function promptUploadFiles({
+     input.click();
+   });
+ }
++
++export async function promptUploadFolder(): Promise<{ files: UploadableFile[] }> {
++  return new Promise((resolve) => {
++    const input = document.createElement('input');
++    input.type = 'file';
++    input.multiple = true;
++    // Non-standard but supported by all major browsers (Chrome, Firefox, Safari, Edge)
++    // for letting the user pick a whole folder from the native file picker.
++    input.webkitdirectory = true;
++
++    input.onchange = () => {
++      const files = [...(input.files ?? [])].map((file) => ({
++        file,
++        // webkitRelativePath looks like "my-folder/sub-folder/file.pdf"
++        relativePath: file.webkitRelativePath ?? '',
++      }));
++      resolve({ files });
++    };
++
++    input.click();
++  });
++}
++
++// Recursively walks a FileSystemDirectoryEntry, resolving every descendant file
++// along with its path relative to the dropped root folder.
++async function readDirectoryEntry(
++  entry: FileSystemDirectoryEntry,
++  basePath: string,
++): Promise<UploadableFile[]> {
++  const reader = entry.createReader();
++
++  // readEntries() only returns a batch at a time (spec quirk), so it must be called
++  // repeatedly until it resolves an empty array.
++  const readAllEntries = async (): Promise<FileSystemEntry[]> => {
++    const entries: FileSystemEntry[] = [];
++    for (;;) {
++      const batch = await new Promise<FileSystemEntry[]>((resolve, reject) => {
++        reader.readEntries(resolve, reject);
++      });
++      if (batch.length === 0) {
++        break;
++      }
++      entries.push(...batch);
++    }
++    return entries;
++  };
++
++  const entries = await readAllEntries();
++
++  const results = await Promise.all(
++    entries.map(async (childEntry) => {
++      const childPath = `${basePath}${childEntry.name}`;
++
++      if (childEntry.isDirectory) {
++        return readDirectoryEntry(childEntry as FileSystemDirectoryEntry, `${childPath}/`);
++      }
++
++      const file = await new Promise<File>((resolve, reject) => {
++        (childEntry as FileSystemFileEntry).file(resolve, reject);
++      });
++
++      return [{ file, relativePath: childPath }];
++    }),
++  );
++
++  return results.flat();
++}
++
++// Resolves the files dropped onto a drop zone, walking any dropped folders recursively.
++// Falls back to the flat `dataTransfer.files` list when the (non-standard, but universally
++// supported) `webkitGetAsEntry` API isn't available.
++export async function getFilesFromDataTransfer(
++  dataTransfer: DataTransfer,
++): Promise<{ files: UploadableFile[] }> {
++  const items = dataTransfer.items ? [...dataTransfer.items] : [];
++  const canWalkEntries = items.length > 0 && typeof items[0]?.webkitGetAsEntry === 'function';
++
++  if (!canWalkEntries) {
++    return {
++      files: [...(dataTransfer.files ?? [])].map((file) => ({ file, relativePath: '' })),
++    };
++  }
++
++  const entries = items
++    .map((item) => item.webkitGetAsEntry())
++    .filter((entry): entry is FileSystemEntry => entry !== null);
++
++  const results = await Promise.all(
++    entries.map(async (entry) => {
++      if (entry.isDirectory) {
++        return readDirectoryEntry(entry as FileSystemDirectoryEntry, `${entry.name}/`);
++      }
++
++      const file = await new Promise<File>((resolve, reject) => {
++        (entry as FileSystemFileEntry).file(resolve, reject);
++      });
++
++      return [{ file, relativePath: '' }];
++    }),
++  );
++
++  return { files: results.flat() };
++}
++
++// True when at least one of the resolved files came from a folder (drag-and-drop or
++// folder picker), as opposed to a flat multi-file selection.
++export function containsFolderStructure(files: UploadableFile[]): boolean {
++  return files.some(({ relativePath }) => relativePath.includes('/'));
++}
+diff --git a/apps/papra-server/src/modules/documents/document-search/database-fts5/database-fts5.repository.models.ts b/apps/papra-server/src/modules/documents/document-search/database-fts5/database-fts5.repository.models.ts
+index 38d1fe3..ce37c26 100644
+--- a/apps/papra-server/src/modules/documents/document-search/database-fts5/database-fts5.repository.models.ts
++++ b/apps/papra-server/src/modules/documents/document-search/database-fts5/database-fts5.repository.models.ts
+@@ -6,6 +6,7 @@ import type { CustomPropertyDefinition } from './query-builder/query-builder.cus
+ import { parseSearchQuery } from '@papra/search-parser';
+ import { and, asc, desc, eq, sql } from 'drizzle-orm';
+ import { documentsTable } from '../../documents.table';
++import { documentsTagsTable, tagsTable } from '../../../tags/tags.table';
+ import { buildQueryFromExpression } from './query-builder/query-builder';
+ 
+ export function makeSearchWhereClause({
+@@ -50,6 +51,15 @@ const sortableColumnsByField: Record<DocumentSearchSortField, SQLiteColumn | SQL
+   updatedAt: documentsTable.updatedAt,
+   name: sql`${documentsTable.name} COLLATE NOCASE`, // case-insensitive sorting for name
+   documentDate: documentsTable.documentDate,
++  // Documents can have several tags, so we sort by the alphabetically-first tag name.
++  // Untagged documents have a NULL sort value, which SQLite places first in ASC order
++  // and last in DESC order.
++  tags: sql`(
++    SELECT MIN(${tagsTable.name} COLLATE NOCASE)
++    FROM ${documentsTagsTable}
++    INNER JOIN ${tagsTable} ON ${tagsTable.id} = ${documentsTagsTable.tagId}
++    WHERE ${documentsTagsTable.documentId} = ${documentsTable.id}
++  )`,
+ };
+ 
+ export function makeSearchOrderByClauses({ sort }: { sort: DocumentSearchSort }) {
+diff --git a/apps/papra-server/src/modules/documents/document-search/document-search.constants.ts b/apps/papra-server/src/modules/documents/document-search/document-search.constants.ts
+index c5a404a..2a0bdfe 100644
+--- a/apps/papra-server/src/modules/documents/document-search/document-search.constants.ts
++++ b/apps/papra-server/src/modules/documents/document-search/document-search.constants.ts
+@@ -1,4 +1,4 @@
+-export const documentSearchSortFields = ['createdAt', 'updatedAt', 'name', 'documentDate'] as const;
++export const documentSearchSortFields = ['createdAt', 'updatedAt', 'name', 'documentDate', 'tags'] as const;
+ export type DocumentSearchSortField = (typeof documentSearchSortFields)[number];
+ 
+ export const documentSearchSortOrders = ['asc', 'desc'] as const;
+diff --git a/apps/papra-server/src/modules/documents/documents-batch/documents-batch.routes.ts b/apps/papra-server/src/modules/documents/documents-batch/documents-batch.routes.ts
+index 491e864..91ba466 100644
+--- a/apps/papra-server/src/modules/documents/documents-batch/documents-batch.routes.ts
++++ b/apps/papra-server/src/modules/documents/documents-batch/documents-batch.routes.ts
+@@ -3,18 +3,21 @@ import * as v from 'valibot';
+ import { API_KEY_PERMISSIONS } from '../../api-keys/api-keys.constants';
+ import { requireAuthentication } from '../../app/auth/auth.middleware';
+ import { getUser } from '../../app/auth/auth.models';
++import { createFoldersRepository } from '../../folders/folders.repository';
++import { createFolderNotFoundError } from '../../folders/folders.errors';
+ import { organizationIdSchema } from '../../organizations/organization.schemas';
+ import { createOrganizationsRepository } from '../../organizations/organizations.repository';
+ import { ensureUserIsInOrganization } from '../../organizations/organizations.usecases';
+ import { validateJsonBody, validateParams } from '../../shared/validation/validation';
+ import { createTagsRepository } from '../../tags/tags.repository';
+ import { createDocumentsRepository } from '../documents.repository';
+-import { batchTagsBodySchema, batchTrashBodySchema } from './documents-batch.schemas';
+-import { tagDocumentsBatch, trashDocumentsBatch } from './documents-batch.usecases';
++import { batchMoveBodySchema, batchTagsBodySchema, batchTrashBodySchema } from './documents-batch.schemas';
++import { moveDocumentsBatch, tagDocumentsBatch, trashDocumentsBatch } from './documents-batch.usecases';
+ 
+ export function registerDocumentsBatchRoutes(context: RouteDefinitionContext) {
+   setupBatchTrashDocumentsRoute(context);
+   setupBatchTagDocumentsRoute(context);
++  setupBatchMoveDocumentsRoute(context);
+ }
+ 
+ function setupBatchTrashDocumentsRoute({
+@@ -56,6 +59,55 @@ function setupBatchTrashDocumentsRoute({
+   );
+ }
+ 
++function setupBatchMoveDocumentsRoute({
++  app,
++  db,
++  eventServices,
++  documentSearchServices,
++}: RouteDefinitionContext) {
++  app.post(
++    '/api/organizations/:organizationId/documents/batch/move',
++    requireAuthentication({ apiKeyPermissions: ['documents:update'] }),
++    validateParams(
++      v.strictObject({
++        organizationId: organizationIdSchema,
++      }),
++    ),
++    validateJsonBody(batchMoveBodySchema),
++    async (context) => {
++      const { userId } = getUser({ context });
++      const { organizationId } = context.req.valid('param');
++      const { filter, folderId } = context.req.valid('json');
++
++      const documentsRepository = createDocumentsRepository({ db });
++      const organizationsRepository = createOrganizationsRepository({ db });
++
++      await ensureUserIsInOrganization({ userId, organizationId, organizationsRepository });
++
++      if (folderId) {
++        const foldersRepository = createFoldersRepository({ db });
++        const { folder } = await foldersRepository.getFolderById({ folderId, organizationId });
++
++        if (!folder) {
++          throw createFolderNotFoundError();
++        }
++      }
++
++      await moveDocumentsBatch({
++        filter,
++        folderId,
++        organizationId,
++        userId,
++        documentsRepository,
++        documentSearchServices,
++        eventServices,
++      });
++
++      return context.body(null, 204);
++    },
++  );
++}
++
+ function setupBatchTagDocumentsRoute({
+   app,
+   db,
+diff --git a/apps/papra-server/src/modules/documents/documents-batch/documents-batch.schemas.ts b/apps/papra-server/src/modules/documents/documents-batch/documents-batch.schemas.ts
+index 77832f2..c7d8e1a 100644
+--- a/apps/papra-server/src/modules/documents/documents-batch/documents-batch.schemas.ts
++++ b/apps/papra-server/src/modules/documents/documents-batch/documents-batch.schemas.ts
+@@ -1,4 +1,5 @@
+ import * as v from 'valibot';
++import { folderIdSchema } from '../../folders/folders.schemas';
+ import { tagIdSchema } from '../../tags/tags.schemas';
+ import { documentIdSchema, searchDocumentsQuerySchema } from '../documents.schemas';
+ import { BATCH_MAX_DOCUMENTS, BATCH_MAX_TAGS_PER_REQUEST } from './documents-batch.constants';
+@@ -20,6 +21,11 @@ export const batchTrashBodySchema = v.strictObject({
+   filter: batchTargetFilterSchema,
+ });
+ 
++export const batchMoveBodySchema = v.strictObject({
++  filter: batchTargetFilterSchema,
++  folderId: v.nullable(folderIdSchema),
++});
++
+ const tagIdsListSchema = v.optional(
+   v.pipe(v.array(tagIdSchema), v.maxLength(BATCH_MAX_TAGS_PER_REQUEST)),
+   [],
+diff --git a/apps/papra-server/src/modules/documents/documents-batch/documents-batch.usecases.test.ts b/apps/papra-server/src/modules/documents/documents-batch/documents-batch.usecases.test.ts
+index 9ebdf1a..e0b984f 100644
+--- a/apps/papra-server/src/modules/documents/documents-batch/documents-batch.usecases.test.ts
++++ b/apps/papra-server/src/modules/documents/documents-batch/documents-batch.usecases.test.ts
+@@ -1,4 +1,5 @@
+ import type { DocumentSearchServices } from '../document-search/document-search.types';
++import { eq } from 'drizzle-orm';
+ import { describe, expect, test } from 'vitest';
+ import { createInMemoryDatabase } from '../../app/database/database.test-utils';
+ import { createTestEventServices } from '../../app/events/events.test-utils';
+@@ -6,11 +7,13 @@ import { ORGANIZATION_ROLES } from '../../organizations/organizations.constants'
+ import { pick } from '../../shared/objects';
+ import { createTagsRepository } from '../../tags/tags.repository';
+ import { documentsTagsTable } from '../../tags/tags.table';
++import { foldersTable } from '../../folders/folders.table';
+ import { createDatabaseFts5DocumentSearchServices } from '../document-search/database-fts5/database-fts5.document-search-provider';
+ import { createDocumentsRepository } from '../documents.repository';
+ import { documentsTable } from '../documents.table';
+ import { createDocumentIdsNotFromOrganizationError } from './documents-batch.errors';
+ import {
++  moveDocumentsBatch,
+   resolveBatchTargetDocumentIds,
+   tagDocumentsBatch,
+   trashDocumentsBatch,
+@@ -451,6 +454,263 @@ describe('documents-batch usecases', () => {
+     });
+   });
+ 
++  describe('moveDocumentsBatch', () => {
++    test('moves documents scoped to the organization, throws if any document does not belong to the organization', async () => {
++      const { db } = await createInMemoryDatabase({
++        users: [{ id: 'user-1', email: 'user-1@example.com' }],
++        organizations: [
++          { id: 'organization-1', name: 'Organization 1' },
++          { id: 'organization-2', name: 'Organization 2' },
++        ],
++        documents: [
++          { id: 'doc-1', ...baseDocument, name: 'doc 1', originalSha256Hash: 'h1' },
++          { id: 'doc-2', ...baseDocument, name: 'doc 2', originalSha256Hash: 'h2' },
++          {
++            id: 'doc-3',
++            organizationId: 'organization-2',
++            mimeType: 'text/plain',
++            originalStorageKey: 's3',
++            originalName: 'doc 3',
++            name: 'doc 3',
++            originalSha256Hash: 'h3',
++          },
++        ],
++      });
++      await db
++        .insert(foldersTable)
++        .values({ id: 'folder-1', organizationId: 'organization-1', name: 'Folder 1' })
++        .execute();
++
++      const documentsRepository = createDocumentsRepository({ db });
++      const { services } = createStubSearchServices();
++
++      await expect(
++        moveDocumentsBatch({
++          filter: { documentIds: ['doc-1', 'doc-3'] },
++          folderId: 'folder-1',
++          organizationId: 'organization-1',
++          userId: 'user-1',
++          documentsRepository,
++          documentSearchServices: services,
++          eventServices: createTestEventServices(),
++        }),
++      ).rejects.toThrow(createDocumentIdsNotFromOrganizationError());
++
++      const records = await db.select().from(documentsTable);
++      const byId = Object.fromEntries(records.map((r) => [r.id, pick(r, ['id', 'folderId'])]));
++      expect(byId).to.eql({
++        'doc-1': { id: 'doc-1', folderId: null },
++        'doc-2': { id: 'doc-2', folderId: null },
++        'doc-3': { id: 'doc-3', folderId: null },
++      });
++    });
++
++    test('moves the resolved documents to the given folder', async () => {
++      const { db } = await createInMemoryDatabase({
++        users: [{ id: 'user-1', email: 'user-1@example.com' }],
++        organizations: [{ id: 'organization-1', name: 'Organization 1' }],
++        documents: [
++          { id: 'doc-1', ...baseDocument, name: 'doc 1', originalSha256Hash: 'h1' },
++          { id: 'doc-2', ...baseDocument, name: 'doc 2', originalSha256Hash: 'h2' },
++        ],
++      });
++      await db
++        .insert(foldersTable)
++        .values({ id: 'folder-1', organizationId: 'organization-1', name: 'Folder 1' })
++        .execute();
++
++      const documentsRepository = createDocumentsRepository({ db });
++      const { services } = createStubSearchServices();
++
++      const { movedDocumentIds } = await moveDocumentsBatch({
++        filter: { documentIds: ['doc-1', 'doc-2'] },
++        folderId: 'folder-1',
++        organizationId: 'organization-1',
++        userId: 'user-1',
++        documentsRepository,
++        documentSearchServices: services,
++        eventServices: createTestEventServices(),
++      });
++
++      expect(movedDocumentIds).to.have.members(['doc-1', 'doc-2']);
++
++      const records = await db.select().from(documentsTable);
++      const byId = Object.fromEntries(records.map((r) => [r.id, r.folderId]));
++      expect(byId).to.eql({ 'doc-1': 'folder-1', 'doc-2': 'folder-1' });
++    });
++
++    test('moving to null moves documents back to the root', async () => {
++      const { db } = await createInMemoryDatabase({
++        users: [{ id: 'user-1', email: 'user-1@example.com' }],
++        organizations: [{ id: 'organization-1', name: 'Organization 1' }],
++        documents: [{ id: 'doc-1', ...baseDocument, name: 'doc 1', originalSha256Hash: 'h1' }],
++      });
++      await db
++        .insert(foldersTable)
++        .values({ id: 'folder-1', organizationId: 'organization-1', name: 'Folder 1' })
++        .execute();
++      await db
++        .update(documentsTable)
++        .set({ folderId: 'folder-1' })
++        .where(eq(documentsTable.id, 'doc-1'))
++        .execute();
++
++      const documentsRepository = createDocumentsRepository({ db });
++      const { services } = createStubSearchServices();
++
++      await moveDocumentsBatch({
++        filter: { documentIds: ['doc-1'] },
++        folderId: null,
++        organizationId: 'organization-1',
++        userId: 'user-1',
++        documentsRepository,
++        documentSearchServices: services,
++        eventServices: createTestEventServices(),
++      });
++
++      const records = await db.select().from(documentsTable);
++      expect(records[0]?.folderId).to.eql(null);
++    });
++
++    test('does not move documents that are in the trash', async () => {
++      const { db } = await createInMemoryDatabase({
++        users: [{ id: 'user-1', email: 'user-1@example.com' }],
++        organizations: [{ id: 'organization-1', name: 'Organization 1' }],
++        documents: [
++          {
++            id: 'doc-1',
++            ...baseDocument,
++            name: 'doc 1',
++            originalSha256Hash: 'h1',
++            isDeleted: true,
++            deletedBy: 'user-1',
++          },
++        ],
++      });
++      await db
++        .insert(foldersTable)
++        .values({ id: 'folder-1', organizationId: 'organization-1', name: 'Folder 1' })
++        .execute();
++
++      const documentsRepository = createDocumentsRepository({ db });
++      const { services } = createStubSearchServices();
++
++      const { movedDocumentIds } = await moveDocumentsBatch({
++        filter: { documentIds: ['doc-1'] },
++        folderId: 'folder-1',
++        organizationId: 'organization-1',
++        userId: 'user-1',
++        documentsRepository,
++        documentSearchServices: services,
++        eventServices: createTestEventServices(),
++      });
++
++      expect(movedDocumentIds).to.eql([]);
++      const records = await db.select().from(documentsTable);
++      expect(records[0]?.folderId).to.eql(null);
++    });
++
++    test('emits a documents.moved event with the actually moved ids', async () => {
++      const { db } = await createInMemoryDatabase({
++        users: [{ id: 'user-1', email: 'user-1@example.com' }],
++        organizations: [{ id: 'organization-1', name: 'Organization 1' }],
++        documents: [{ id: 'doc-1', ...baseDocument, name: 'doc 1', originalSha256Hash: 'h1' }],
++      });
++      await db
++        .insert(foldersTable)
++        .values({ id: 'folder-1', organizationId: 'organization-1', name: 'Folder 1' })
++        .execute();
++
++      const documentsRepository = createDocumentsRepository({ db });
++      const { services } = createStubSearchServices();
++      const eventServices = createTestEventServices();
++
++      await moveDocumentsBatch({
++        filter: { documentIds: ['doc-1'] },
++        folderId: 'folder-1',
++        organizationId: 'organization-1',
++        userId: 'user-1',
++        documentsRepository,
++        documentSearchServices: services,
++        eventServices,
++      });
++
++      expect(eventServices.getEmittedEvents()).to.eql([
++        {
++          eventName: 'documents.moved',
++          payload: {
++            documentIds: ['doc-1'],
++            organizationId: 'organization-1',
++            folderId: 'folder-1',
++            movedBy: 'user-1',
++          },
++        },
++      ]);
++    });
++
++    test('does not emit an event when no documents were moved', async () => {
++      const { db } = await createInMemoryDatabase({
++        organizations: [{ id: 'organization-1', name: 'Organization 1' }],
++      });
++      await db
++        .insert(foldersTable)
++        .values({ id: 'folder-1', organizationId: 'organization-1', name: 'Folder 1' })
++        .execute();
++
++      const documentsRepository = createDocumentsRepository({ db });
++      const { services } = createStubSearchServices({ documentIds: [] });
++      const eventServices = createTestEventServices();
++
++      const { movedDocumentIds } = await moveDocumentsBatch({
++        filter: { query: '' },
++        folderId: 'folder-1',
++        organizationId: 'organization-1',
++        userId: 'user-1',
++        documentsRepository,
++        documentSearchServices: services,
++        eventServices,
++      });
++
++      expect(movedDocumentIds).to.eql([]);
++      expect(eventServices.getEmittedEvents()).to.eql([]);
++    });
++
++    test('resolves a search query to the matching documents and moves them', async () => {
++      const { db } = await createInMemoryDatabase({
++        users: [{ id: 'user-1', email: 'user-1@example.com' }],
++        organizations: [{ id: 'organization-1', name: 'Organization 1' }],
++        documents: [
++          { id: 'doc-1', ...baseDocument, name: 'doc 1', originalSha256Hash: 'h1' },
++          { id: 'doc-2', ...baseDocument, name: 'doc 2', originalSha256Hash: 'h2' },
++        ],
++      });
++      await db
++        .insert(foldersTable)
++        .values({ id: 'folder-1', organizationId: 'organization-1', name: 'Folder 1' })
++        .execute();
++
++      const documentsRepository = createDocumentsRepository({ db });
++      const { services, calls } = createStubSearchServices({ documentIds: ['doc-1'] });
++
++      const { movedDocumentIds } = await moveDocumentsBatch({
++        filter: { query: 'tag:invoice' },
++        folderId: 'folder-1',
++        organizationId: 'organization-1',
++        userId: 'user-1',
++        documentsRepository,
++        documentSearchServices: services,
++        eventServices: createTestEventServices(),
++      });
++
++      expect(movedDocumentIds).to.eql(['doc-1']);
++      expect(calls).to.have.length(1);
++
++      const records = await db.select().from(documentsTable);
++      const byId = Object.fromEntries(records.map((r) => [r.id, r.folderId]));
++      expect(byId).to.eql({ 'doc-1': 'folder-1', 'doc-2': null });
++    });
++  });
++
+   describe('tagDocumentsBatch', () => {
+     const orgTags = [
+       {
+diff --git a/apps/papra-server/src/modules/documents/documents-batch/documents-batch.usecases.ts b/apps/papra-server/src/modules/documents/documents-batch/documents-batch.usecases.ts
+index 6fd4f95..201af84 100644
+--- a/apps/papra-server/src/modules/documents/documents-batch/documents-batch.usecases.ts
++++ b/apps/papra-server/src/modules/documents/documents-batch/documents-batch.usecases.ts
+@@ -127,6 +127,67 @@ export async function trashDocumentsBatch({
+   };
+ }
+ 
++export async function moveDocumentsBatch({
++  filter,
++  folderId,
++  organizationId,
++  userId,
++  documentsRepository,
++  documentSearchServices,
++  eventServices,
++  logger = createLogger({ namespace: 'documents-batch.usecases' }),
++}: {
++  filter: BatchTargetFilter;
++  folderId: string | null;
++  organizationId: string;
++  userId: string;
++  documentsRepository: DocumentsRepository;
++  documentSearchServices: DocumentSearchServices;
++  eventServices: EventServices;
++  logger?: Logger;
++}) {
++  const startTime = Date.now();
++
++  const { documentIds } = await resolveBatchTargetDocumentIds({
++    filter,
++    organizationId,
++    documentSearchServices,
++    documentsRepository,
++    logger,
++  });
++
++  const { movedDocumentIds } = await documentsRepository.moveDocuments({
++    documentIds,
++    organizationId,
++    folderId,
++  });
++
++  if (movedDocumentIds.length > 0) {
++    eventServices.emitEvent({
++      eventName: 'documents.moved',
++      payload: { documentIds: movedDocumentIds, organizationId, folderId, movedBy: userId },
++    });
++  }
++
++  logger.info(
++    {
++      organizationId,
++      userId,
++      folderId,
++      resolvedCount: documentIds.length,
++      movedCount: movedDocumentIds.length,
++      skippedCount: documentIds.length - movedDocumentIds.length,
++      durationMs: Date.now() - startTime,
++    },
++    'Executed batch document move',
++  );
++
++  return {
++    movedDocumentIds,
++    movedCount: movedDocumentIds.length,
++  };
++}
++
+ export async function tagDocumentsBatch({
+   filter,
+   addTagIds,
+diff --git a/apps/papra-server/src/modules/documents/documents.events.types.ts b/apps/papra-server/src/modules/documents/documents.events.types.ts
+index 58e3583..04be21b 100644
+--- a/apps/papra-server/src/modules/documents/documents.events.types.ts
++++ b/apps/papra-server/src/modules/documents/documents.events.types.ts
+@@ -3,6 +3,12 @@ import type { Document } from './documents.types';
+ export type DocumentEvents = {
+   'document.created': { document: Document };
+   'documents.trashed': { documentIds: string[]; organizationId: string; trashedBy: string }; // Soft deleted by moving to trash
++  'documents.moved': {
++    documentIds: string[];
++    organizationId: string;
++    folderId: string | null;
++    movedBy: string;
++  };
+   'document.restored': { documentId: string; organizationId: string; restoredBy: string };
+   'document.updated': {
+     userId?: string;
+diff --git a/apps/papra-server/src/modules/documents/documents.repository.ts b/apps/papra-server/src/modules/documents/documents.repository.ts
+index 219eb53..ebf8651 100644
+--- a/apps/papra-server/src/modules/documents/documents.repository.ts
++++ b/apps/papra-server/src/modules/documents/documents.repository.ts
+@@ -36,6 +36,7 @@ export function createDocumentsRepository({ db }: { db: Database }) {
+       getAllOrganizationUndeletedDocumentsIterator,
+       getAllOrganizationUndeletedDocumentsForBackup,
+       updateDocument,
++      moveDocuments,
+       getGlobalDocumentsStats,
+       areAllDocumentsInOrganization,
+     },
+@@ -242,6 +243,48 @@ async function softDeleteDocuments({
+   return { trashedDocumentIds };
+ }
+ 
++// Chunked to stay safely under SQLite's host parameter limit (default 32766)
++// when the documentIds list is large (e.g. resolved from a search query).
++const MOVE_DOCUMENTS_CHUNK_SIZE = 500;
++
++async function moveDocuments({
++  documentIds,
++  organizationId,
++  folderId,
++  db,
++}: {
++  documentIds: string[];
++  organizationId: string;
++  folderId: string | null;
++  db: Database;
++}) {
++  if (documentIds.length === 0) {
++    return { movedDocumentIds: [] };
++  }
++
++  const movedDocumentIds: string[] = [];
++
++  const chunks = chunkArray(documentIds, MOVE_DOCUMENTS_CHUNK_SIZE);
++
++  for (const idsChunk of chunks) {
++    const rows = await db
++      .update(documentsTable)
++      .set({ folderId })
++      .where(
++        and(
++          inArray(documentsTable.id, idsChunk),
++          eq(documentsTable.organizationId, organizationId),
++          eq(documentsTable.isDeleted, false),
++        ),
++      )
++      .returning({ id: documentsTable.id });
++
++    movedDocumentIds.push(...rows.map((row) => row.id));
++  }
++
++  return { movedDocumentIds };
++}
++
+ async function restoreDocument({
+   documentId,
+   organizationId,

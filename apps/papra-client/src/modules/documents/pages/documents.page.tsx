@@ -18,6 +18,7 @@ import { Button } from '@/modules/ui/components/button';
 import { createToast } from '@/modules/ui/components/sonner';
 import { TextField, TextFieldRoot } from '@/modules/ui/components/textfield';
 import { DocumentUploadArea } from '../components/document-upload-area.component';
+import { DocumentsBatchMoveDialog } from '../components/documents-batch-move-dialog.component';
 import { DocumentsBatchTagDialog } from '../components/documents-batch-tag-dialog.component';
 import {
   createdAtColumn,
@@ -26,7 +27,7 @@ import {
   standardActionsColumn,
   tagsColumn,
 } from '../components/documents-list.component';
-import { batchTrashDocuments, batchUpdateDocumentTags } from '../documents-batch.services';
+import { batchMoveDocuments, batchTrashDocuments, batchUpdateDocumentTags } from '../documents-batch.services';
 import {
   DEFAULT_DOCUMENT_SEARCH_SORT_FIELD,
   DEFAULT_DOCUMENT_SEARCH_SORT_ORDER,
@@ -48,6 +49,7 @@ export const DocumentsPage: Component = () => {
   const [getRowSelection, setRowSelection] = createSignal<RowSelectionState>({});
   const [getSelectAllMatchingQuery, setSelectAllMatchingQuery] = createSignal(false);
   const [getTagDialogOpen, setTagDialogOpen] = createSignal(false);
+  const [getMoveDialogOpen, setMoveDialogOpen] = createSignal(false);
 
   const [getSortField, setSortField] = createParamSynchronizedSignal<DocumentSearchSortField>({
     paramKey: 'sortField',
@@ -235,6 +237,35 @@ export const DocumentsPage: Component = () => {
     },
   }));
 
+  const moveMutation = useMutation(() => ({
+    mutationFn: async ({ folderId }: { folderId: string | null }) => {
+      const filter = getBatchFilter();
+      if (!filter) {
+        return;
+      }
+      await batchMoveDocuments({
+        organizationId: params.organizationId,
+        filter,
+        folderId,
+      });
+    },
+    onSuccess: () => {
+      const count = getEffectiveCount();
+      invalidateDocuments();
+      clearSelection();
+      createToast({
+        message: t('documents.list.batch.move.success', { count }),
+        type: 'success',
+      });
+    },
+    onError: () => {
+      createToast({
+        message: t('documents.list.batch.error'),
+        type: 'error',
+      });
+    },
+  }));
+
   const showToolbar = () => getSelectedIds().length > 0 || getSelectAllMatchingQuery();
 
   async function handleBatchTrash() {
@@ -266,7 +297,7 @@ export const DocumentsPage: Component = () => {
               {t('documents.list.no-documents.description')}
             </p>
 
-            <DocumentUploadArea />
+            <DocumentUploadArea organizationId={params.organizationId} />
           </>
         ) : (
           <>
@@ -388,7 +419,7 @@ export const DocumentsPage: Component = () => {
                       variant="outline"
                       size="sm"
                       onClick={() => setTagDialogOpen(true)}
-                      disabled={tagMutation.isPending || trashMutation.isPending}
+                      disabled={tagMutation.isPending || trashMutation.isPending || moveMutation.isPending}
                     >
                       <div class="i-tabler-tag size-4 mr-2" />
                       {t('documents.list.batch.tag-action')}
@@ -397,9 +428,19 @@ export const DocumentsPage: Component = () => {
                     <Button
                       variant="outline"
                       size="sm"
+                      onClick={() => setMoveDialogOpen(true)}
+                      disabled={tagMutation.isPending || trashMutation.isPending || moveMutation.isPending}
+                    >
+                      <div class="i-tabler-folder-symlink size-4 mr-2" />
+                      {t('documents.list.batch.move-action')}
+                    </Button>
+
+                    <Button
+                      variant="outline"
+                      size="sm"
                       onClick={handleBatchTrash}
                       isLoading={trashMutation.isPending}
-                      disabled={tagMutation.isPending}
+                      disabled={tagMutation.isPending || moveMutation.isPending}
                       class="text-red-500 hover:text-red-600"
                     >
                       <div class="i-tabler-trash size-4 mr-2" />
@@ -411,7 +452,7 @@ export const DocumentsPage: Component = () => {
                       size="icon"
                       class="size-8"
                       onClick={clearSelection}
-                      disabled={tagMutation.isPending || trashMutation.isPending}
+                      disabled={tagMutation.isPending || trashMutation.isPending || moveMutation.isPending}
                       aria-label={t('documents.list.batch.clear')}
                     >
                       <div class="i-tabler-x size-4" />
@@ -456,6 +497,18 @@ export const DocumentsPage: Component = () => {
               onSubmit={({ addTagIds, removeTagIds }) => {
                 setTagDialogOpen(false);
                 tagMutation.mutate({ addTagIds, removeTagIds });
+              }}
+            />
+
+            <DocumentsBatchMoveDialog
+              open={getMoveDialogOpen()}
+              onOpenChange={setMoveDialogOpen}
+              organizationId={params.organizationId}
+              selectionCount={getEffectiveCount()}
+              isPending={moveMutation.isPending}
+              onSubmit={({ folderId }) => {
+                setMoveDialogOpen(false);
+                moveMutation.mutate({ folderId });
               }}
             />
           </>

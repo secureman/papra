@@ -141,7 +141,7 @@ export const tagsColumn: ColumnDef<Document> = {
     return <span class="hidden sm:block">{t('documents.list.table.headers.tags')}</span>;
   },
   accessorKey: 'tags',
-  enableSorting: false,
+  enableSorting: true,
   cell: (data) => (
     <DocumentTagsList
       tags={data.getValue<Tag[]>()}

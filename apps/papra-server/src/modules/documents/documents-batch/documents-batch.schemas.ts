@@ -1,4 +1,5 @@
 import * as v from 'valibot';
+import { folderIdSchema } from '../../folders/folders.schemas';
 import { tagIdSchema } from '../../tags/tags.schemas';
 import { documentIdSchema, searchDocumentsQuerySchema } from '../documents.schemas';
 import { BATCH_MAX_DOCUMENTS, BATCH_MAX_TAGS_PER_REQUEST } from './documents-batch.constants';
@@ -18,6 +19,11 @@ export const batchTargetFilterSchema = v.union([
 
 export const batchTrashBodySchema = v.strictObject({
   filter: batchTargetFilterSchema,
+});
+
+export const batchMoveBodySchema = v.strictObject({
+  filter: batchTargetFilterSchema,
+  folderId: v.nullable(folderIdSchema),
 });
 
 const tagIdsListSchema = v.optional(

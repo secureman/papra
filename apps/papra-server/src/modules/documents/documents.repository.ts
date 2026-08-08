@@ -36,6 +36,7 @@ export function createDocumentsRepository({ db }: { db: Database }) {
       getAllOrganizationUndeletedDocumentsIterator,
       getAllOrganizationUndeletedDocumentsForBackup,
       updateDocument,
+      moveDocuments,
       getGlobalDocumentsStats,
       areAllDocumentsInOrganization,
     },
@@ -240,6 +241,48 @@ async function softDeleteDocuments({
   }
 
   return { trashedDocumentIds };
+}
+
+// Chunked to stay safely under SQLite's host parameter limit (default 32766)
+// when the documentIds list is large (e.g. resolved from a search query).
+const MOVE_DOCUMENTS_CHUNK_SIZE = 500;
+
+async function moveDocuments({
+  documentIds,
+  organizationId,
+  folderId,
+  db,
+}: {
+  documentIds: string[];
+  organizationId: string;
+  folderId: string | null;
+  db: Database;
+}) {
+  if (documentIds.length === 0) {
+    return { movedDocumentIds: [] };
+  }
+
+  const movedDocumentIds: string[] = [];
+
+  const chunks = chunkArray(documentIds, MOVE_DOCUMENTS_CHUNK_SIZE);
+
+  for (const idsChunk of chunks) {
+    const rows = await db
+      .update(documentsTable)
+      .set({ folderId })
+      .where(
+        and(
+          inArray(documentsTable.id, idsChunk),
+          eq(documentsTable.organizationId, organizationId),
+          eq(documentsTable.isDeleted, false),
+        ),
+      )
+      .returning({ id: documentsTable.id });
+
+    movedDocumentIds.push(...rows.map((row) => row.id));
+  }
+
+  return { movedDocumentIds };
 }
 
 async function restoreDocument({

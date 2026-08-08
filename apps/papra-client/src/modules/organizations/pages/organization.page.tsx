@@ -56,7 +56,7 @@ export const OrganizationPage: Component = () => {
               {t('organizations.details.no-documents.description')}
             </p>
 
-            <DocumentUploadArea />
+            <DocumentUploadArea organizationId={params.organizationId} />
           </>
         ) : (
           <>

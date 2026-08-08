@@ -3,18 +3,21 @@ import * as v from 'valibot';
 import { API_KEY_PERMISSIONS } from '../../api-keys/api-keys.constants';
 import { requireAuthentication } from '../../app/auth/auth.middleware';
 import { getUser } from '../../app/auth/auth.models';
+import { createFoldersRepository } from '../../folders/folders.repository';
+import { createFolderNotFoundError } from '../../folders/folders.errors';
 import { organizationIdSchema } from '../../organizations/organization.schemas';
 import { createOrganizationsRepository } from '../../organizations/organizations.repository';
 import { ensureUserIsInOrganization } from '../../organizations/organizations.usecases';
 import { validateJsonBody, validateParams } from '../../shared/validation/validation';
 import { createTagsRepository } from '../../tags/tags.repository';
 import { createDocumentsRepository } from '../documents.repository';
-import { batchTagsBodySchema, batchTrashBodySchema } from './documents-batch.schemas';
-import { tagDocumentsBatch, trashDocumentsBatch } from './documents-batch.usecases';
+import { batchMoveBodySchema, batchTagsBodySchema, batchTrashBodySchema } from './documents-batch.schemas';
+import { moveDocumentsBatch, tagDocumentsBatch, trashDocumentsBatch } from './documents-batch.usecases';
 
 export function registerDocumentsBatchRoutes(context: RouteDefinitionContext) {
   setupBatchTrashDocumentsRoute(context);
   setupBatchTagDocumentsRoute(context);
+  setupBatchMoveDocumentsRoute(context);
 }
 
 function setupBatchTrashDocumentsRoute({
@@ -44,6 +47,55 @@ function setupBatchTrashDocumentsRoute({
 
       await trashDocumentsBatch({
         filter,
+        organizationId,
+        userId,
+        documentsRepository,
+        documentSearchServices,
+        eventServices,
+      });
+
+      return context.body(null, 204);
+    },
+  );
+}
+
+function setupBatchMoveDocumentsRoute({
+  app,
+  db,
+  eventServices,
+  documentSearchServices,
+}: RouteDefinitionContext) {
+  app.post(
+    '/api/organizations/:organizationId/documents/batch/move',
+    requireAuthentication({ apiKeyPermissions: ['documents:update'] }),
+    validateParams(
+      v.strictObject({
+        organizationId: organizationIdSchema,
+      }),
+    ),
+    validateJsonBody(batchMoveBodySchema),
+    async (context) => {
+      const { userId } = getUser({ context });
+      const { organizationId } = context.req.valid('param');
+      const { filter, folderId } = context.req.valid('json');
+
+      const documentsRepository = createDocumentsRepository({ db });
+      const organizationsRepository = createOrganizationsRepository({ db });
+
+      await ensureUserIsInOrganization({ userId, organizationId, organizationsRepository });
+
+      if (folderId) {
+        const foldersRepository = createFoldersRepository({ db });
+        const { folder } = await foldersRepository.getFolderById({ folderId, organizationId });
+
+        if (!folder) {
+          throw createFolderNotFoundError();
+        }
+      }
+
+      await moveDocumentsBatch({
+        filter,
+        folderId,
         organizationId,
         userId,
         documentsRepository,
