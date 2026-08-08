@@ -217,6 +217,7 @@ export async function restoreFromRemoteFile({
     path: `${DESTINATIONS_PATH(organizationId)}/${destinationId}/remote-files/restore`,
     method: 'POST',
     body: { remoteFileId },
+    timeout: 600000, // 10 minutes for large restores
   });
 }
 
@@ -237,6 +238,7 @@ export async function restoreBackupRun({
   }>({
     path: `${DESTINATIONS_PATH(organizationId)}/${destinationId}/runs/${runId}/restore`,
     method: 'POST',
+    timeout: 600000, // 10 minutes for large restores
   });
 }
 
@@ -258,6 +260,7 @@ export async function restoreFromUploadedFile({
     path: `/api/organizations/${organizationId}/backups/recover-from-file`,
     method: 'POST',
     body: getFormData({ file }),
+    timeout: 600000, // 10 minutes for large restores
   });
 }
 

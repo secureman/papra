@@ -7,6 +7,9 @@ import { organizationIdSchema } from '../organizations/organization.schemas';
 import { createOrganizationsRepository } from '../organizations/organizations.repository';
 import { ensureUserIsInOrganization } from '../organizations/organizations.usecases';
 import { formatDocumentsForApi } from '../documents/documents.models';
+import { enrichAndFormatDocumentsForApi } from '../documents/documents.usecases';
+import { createCustomPropertiesRepository } from '../custom-properties/custom-properties.repository';
+import { createTagsRepository } from '../tags/tags.repository';
 import { validateJsonBody, validateParams, validateQuery } from '../shared/validation/validation';
 import { createFolderNotFoundError } from './folders.errors';
 import { createFoldersRepository } from './folders.repository';
@@ -88,6 +91,8 @@ function setupGetFolderContentsRoute({ app, db }: RouteDefinitionContext) {
 
       const foldersRepository = createFoldersRepository({ db });
       const organizationsRepository = createOrganizationsRepository({ db });
+      const tagsRepository = createTagsRepository({ db });
+      const customPropertiesRepository = createCustomPropertiesRepository({ db });
 
       await ensureUserIsInOrganization({ userId, organizationId, organizationsRepository });
 
@@ -103,9 +108,15 @@ function setupGetFolderContentsRoute({ app, db }: RouteDefinitionContext) {
         folderId: folderId ?? null,
       });
 
+      const { enrichedDocuments } = await enrichAndFormatDocumentsForApi({
+        documents,
+        tagsRepository,
+        customPropertiesRepository,
+      });
+
       return context.json({
         folders,
-        documents: formatDocumentsForApi({ documents }),
+        documents: enrichedDocuments,
       });
     },
   );

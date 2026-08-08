@@ -9,9 +9,13 @@ import {
   createdAtColumn,
   DocumentsPaginatedList,
   standardActionsColumn,
+  tagsColumn,
 } from '@/modules/documents/components/documents-list.component';
 import { useFolderAwareUpload } from '@/modules/documents/composables/use-folder-aware-upload';
-import { batchMoveDocuments, batchTrashDocuments } from '@/modules/documents/documents-batch.services';
+import {
+  batchMoveDocuments,
+  batchTrashDocuments,
+} from '@/modules/documents/documents-batch.services';
 import { invalidateOrganizationDocumentsQuery } from '@/modules/documents/documents.composables';
 import { useI18n } from '@/modules/i18n/i18n.provider';
 import { useConfirmModal } from '@/modules/shared/confirm';
@@ -209,7 +213,10 @@ export const FolderPage: Component = () => {
     const confirmed = await confirm({
       title: t('documents.list.batch.trash.confirm.title'),
       message: t('documents.list.batch.trash.confirm.description', { count }),
-      confirmButton: { text: t('documents.list.batch.trash.confirm.label'), variant: 'destructive' },
+      confirmButton: {
+        text: t('documents.list.batch.trash.confirm.label'),
+        variant: 'destructive',
+      },
       cancelButton: { text: t('documents.list.batch.trash.confirm.cancel') },
     });
     if (!confirmed) {
@@ -367,7 +374,9 @@ export const FolderPage: Component = () => {
   return (
     <div
       class="p-6 mt-4 pb-32 mx-auto max-w-5xl relative"
-      classList={{ 'outline outline-2 outline-primary outline-dashed rounded-lg': isDraggingOverFolder() }}
+      classList={{
+        'outline outline-2 outline-primary outline-dashed rounded-lg': isDraggingOverFolder(),
+      }}
       onDragOver={(event) => {
         event.preventDefault();
         setIsDraggingOverFolder(true);
@@ -571,7 +580,7 @@ export const FolderPage: Component = () => {
                 getRowSelection={getDocumentRowSelection}
                 setRowSelection={setDocumentRowSelection}
                 showPagination={false}
-                extraColumns={[createdAtColumn, standardActionsColumn]}
+                extraColumns={[tagsColumn, createdAtColumn, standardActionsColumn]}
               />
 
               <DocumentsBatchMoveDialog

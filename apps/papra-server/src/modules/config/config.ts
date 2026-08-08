@@ -141,6 +141,23 @@ export const configDefinition = {
           route: '/api/organizations/:organizationId/documents',
           timeoutMs: 5 * IN_MS.MINUTE,
         },
+        {
+          method: 'POST',
+          route:
+            '/api/organizations/:organizationId/backups/destinations/:destinationId/runs/:runId/restore',
+          timeoutMs: 15 * IN_MS.MINUTE,
+        },
+        {
+          method: 'POST',
+          route:
+            '/api/organizations/:organizationId/backups/destinations/:destinationId/remote-files/restore',
+          timeoutMs: 15 * IN_MS.MINUTE,
+        },
+        {
+          method: 'POST',
+          route: '/api/organizations/:organizationId/backups/recover-from-file',
+          timeoutMs: 15 * IN_MS.MINUTE,
+        },
       ],
       showInDocumentation: false, // mainly used for internal overrides
     },

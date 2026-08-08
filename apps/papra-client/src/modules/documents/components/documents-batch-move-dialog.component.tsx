@@ -33,7 +33,7 @@ export const DocumentsBatchMoveDialog: Component<{
   onSubmit: (args: { folderId: string | null }) => void;
 }> = (props) => {
   const { t } = useI18n();
-  const [getFolderId, setFolderId] = createSignal<string | null>(null);
+  const [getFolderId, setFolderId] = createSignal<string | null | undefined>(undefined);
 
   const foldersQuery = useQuery(() => ({
     queryKey: ['organizations', props.organizationId, 'folders'],
@@ -56,12 +56,14 @@ export const DocumentsBatchMoveDialog: Component<{
   createEffect(
     on(
       () => props.open,
-      () => setFolderId(null),
+      () => setFolderId(undefined),
     ),
   );
 
   function handleSubmit() {
-    props.onSubmit({ folderId: getFolderId() });
+    const folderId = getFolderId();
+    if (folderId === undefined) return;
+    props.onSubmit({ folderId });
   }
 
   return (
@@ -80,7 +82,7 @@ export const DocumentsBatchMoveDialog: Component<{
             optionValue="id"
             optionTextValue="label"
             value={getOptions().find((option) => option.id === getFolderId())}
-            onChange={(value) => setFolderId(value ? value.id : null)}
+            onChange={(value) => setFolderId(value?.id)}
             itemComponent={(itemProps) => (
               <SelectItem class="cursor-pointer" item={itemProps.item}>
                 {itemProps.item.rawValue.label}
@@ -103,7 +105,11 @@ export const DocumentsBatchMoveDialog: Component<{
             >
               {t('documents.list.batch.move.dialog.cancel')}
             </Button>
-            <Button onClick={handleSubmit} disabled={props.isPending} isLoading={props.isPending}>
+            <Button
+              onClick={handleSubmit}
+              disabled={props.isPending || getFolderId() === undefined}
+              isLoading={props.isPending}
+            >
               {t('documents.list.batch.move.dialog.submit')}
             </Button>
           </div>

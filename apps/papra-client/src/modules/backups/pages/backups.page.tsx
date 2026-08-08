@@ -26,7 +26,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/modules/ui/components/select';
-import { createToast } from '@/modules/ui/components/sonner';
+import { createToast, toast } from '@/modules/ui/components/sonner';
 import { Switch, SwitchControl, SwitchThumb } from '@/modules/ui/components/switch';
 import {
   Table,
@@ -540,6 +540,7 @@ const DestinationCard: Component<{
 }> = (props) => {
   const queryClient = useQueryClient();
   const [isRunning, setIsRunning] = createSignal(false);
+  const [restoringRunId, setRestoringRunId] = createSignal<string | null>(null);
   const [pollingInterval, setPollingInterval] = createSignal<ReturnType<typeof setInterval> | null>(
     null,
   );
@@ -711,7 +712,7 @@ const DestinationCard: Component<{
       createToast({ type: 'error', message: props.getErrorMessage({ error }) });
       return;
     }
-    invalidateRuns();
+    void invalidateRuns();
   };
 
   const [verifyingRunId, setVerifyingRunId] = createSignal<string | null>(null);
@@ -751,6 +752,16 @@ const DestinationCard: Component<{
         'Documents from this backup will be re-imported. Documents that already exist (by content hash) are skipped.',
     });
     if (!isConfirmed) return;
+    setRestoringRunId(run.id);
+
+    const restoreToastId = `restore-${run.id}`;
+    createToast({
+      type: 'loading',
+      id: restoreToastId,
+      message: `Restoring backup (${run.documentsCount ?? '—'} documents). This may take several minutes...`,
+      duration: Infinity, // Don't auto-dismiss
+    });
+
     const [result, error] = await safely(
       restoreBackupRun({
         organizationId: props.organizationId,
@@ -758,6 +769,11 @@ const DestinationCard: Component<{
         runId: run.id,
       }),
     );
+
+    // Dismiss the loading toast
+    toast.dismiss(restoreToastId);
+
+    setRestoringRunId(null);
     if (error) {
       createToast({ type: 'error', message: props.getErrorMessage({ error }) });
       return;
@@ -771,6 +787,7 @@ const DestinationCard: Component<{
           ? ` (${result.skippedDuplicatesCount} already present)`
           : ''),
     });
+    void invalidateRuns();
   };
 
   return (
@@ -894,8 +911,13 @@ const DestinationCard: Component<{
                   <TableCell>{formatBytes(run.totalSizeBytes)}</TableCell>
                   <TableCell class="flex gap-2 justify-end">
                     <Show when={run.status === 'succeeded'}>
-                      <Button size="sm" variant="outline" onClick={() => handleRestoreRun(run)}>
-                        Restore
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        onClick={() => handleRestoreRun(run)}
+                        disabled={restoringRunId() !== null}
+                      >
+                        {restoringRunId() === run.id ? 'Restoring...' : 'Restore'}
                       </Button>
                       <Button
                         size="sm"
