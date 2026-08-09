@@ -1,6 +1,6 @@
 import type { ConfigDefinition } from 'figue';
 import * as v from 'valibot';
-import { booleanishSchema } from '../config/config.schemas';
+import { booleanishSchema, numberishSchema } from '../config/config.schemas';
 
 // The server-wide Key Encryption Key. Wraps every destination's refresh
 // token / password and its per-destination backup encryption key. Without this
@@ -23,13 +23,13 @@ export const backupsConfig = {
   },
   retentionDays: {
     doc: 'Number of days to keep backup runs before automatically deleting them. Set to 0 or undefined to disable automatic cleanup.',
-    schema: v.optional(v.pipe(v.number(), v.integer(), v.minValue(0))),
+    schema: v.optional(v.pipe(numberishSchema, v.integer(), v.minValue(0))),
     default: undefined,
     env: 'BACKUPS_RETENTION_DAYS',
   },
   maxRunsToKeepPerDestination: {
     doc: 'Maximum number of succeeded backup runs to keep per destination, oldest deleted first (remote file + local record). Set to 0 or undefined to disable. Can be combined with retentionDays -- a run is deleted if it is caught by either rule.',
-    schema: v.optional(v.pipe(v.number(), v.integer(), v.minValue(0))),
+    schema: v.optional(v.pipe(numberishSchema, v.integer(), v.minValue(0))),
     default: undefined,
     env: 'BACKUPS_MAX_RUNS_TO_KEEP_PER_DESTINATION',
   },

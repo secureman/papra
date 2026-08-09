@@ -961,6 +961,7 @@ function createRestoreProgressReporter({
 }) {
   let lastPersistedAt = 0;
   let lastPersistedCount = -1;
+  let lastDownloadPersistedAt = 0;
 
   const onDownloadStart = async (): Promise<void> => {
     await repository.updateRestoreJob({
@@ -968,6 +969,24 @@ function createRestoreProgressReporter({
       status: 'downloading',
       fields: { startedAt: new Date() },
     });
+  };
+
+  const onDownloadProgress = ({
+    downloadedBytes,
+    totalBytes,
+  }: {
+    downloadedBytes: number;
+    totalBytes: number | null;
+  }): void => {
+    const now = Date.now();
+    if (now - lastDownloadPersistedAt < RESTORE_PROGRESS_PERSIST_INTERVAL_MS) {
+      return;
+    }
+    lastDownloadPersistedAt = now;
+    // Fire-and-forget: this runs inside the driver's streaming read loop,
+    // which shouldn't be slowed down waiting on a DB write for a progress
+    // update that's inherently best-effort anyway.
+    void repository.updateRestoreJob({ jobId, fields: { downloadedBytes, totalBytes } });
   };
 
   const onManifestReady = async ({
@@ -1008,7 +1027,7 @@ function createRestoreProgressReporter({
     await repository.updateRestoreJob({ jobId, fields: { processedDocumentsCount: processedCount } });
   };
 
-  return { onDownloadStart, onManifestReady, onProgress };
+  return { onDownloadStart, onDownloadProgress, onManifestReady, onProgress };
 }
 
 type RestoreOutcome = {
@@ -1079,6 +1098,7 @@ async function restoreArchiveUsecase({
   remoteFileId,
   userId,
   onDownloadStart,
+  onDownloadProgress,
   onManifestReady,
   onProgress,
 }: {
@@ -1091,6 +1111,7 @@ async function restoreArchiveUsecase({
   remoteFileId: string;
   userId?: string;
   onDownloadStart?: () => void | Promise<void>;
+  onDownloadProgress?: (args: { downloadedBytes: number; totalBytes: number | null }) => void;
   onManifestReady?: (args: { totalDocumentsCount: number }) => void | Promise<void>;
   onProgress?: (args: { processedCount: number; totalCount: number }) => void | Promise<void>;
 }) {
@@ -1100,7 +1121,12 @@ async function restoreArchiveUsecase({
   const driver = services.getDriver(destination.driver);
 
   await onDownloadStart?.();
-  const envelope = await driver.downloadFile({ credentials, settings, remoteFileId });
+  const envelope = await driver.downloadFile({
+    credentials,
+    settings,
+    remoteFileId,
+    onProgress: onDownloadProgress,
+  });
 
   return restoreFromEnvelopeUsecase({
     services,
@@ -1288,7 +1314,7 @@ export async function restoreRunUsecase({
     repository,
     jobId: job.id,
     logger: providedLogger,
-    execute: ({ onDownloadStart, onManifestReady, onProgress }) =>
+    execute: ({ onDownloadStart, onDownloadProgress, onManifestReady, onProgress }) =>
       restoreArchiveUsecase({
         services,
         documentUsecaseDeps,
@@ -1299,6 +1325,7 @@ export async function restoreRunUsecase({
         remoteFileId,
         userId,
         onDownloadStart,
+        onDownloadProgress,
         onManifestReady,
         onProgress,
       }),
@@ -1402,7 +1429,7 @@ export async function restoreFromRemoteFileUsecase({
     repository,
     jobId: job.id,
     logger: providedLogger,
-    execute: ({ onDownloadStart, onManifestReady, onProgress }) =>
+    execute: ({ onDownloadStart, onDownloadProgress, onManifestReady, onProgress }) =>
       restoreArchiveUsecase({
         services,
         documentUsecaseDeps,
@@ -1413,6 +1440,7 @@ export async function restoreFromRemoteFileUsecase({
         remoteFileId,
         userId,
         onDownloadStart,
+        onDownloadProgress,
         onManifestReady,
         onProgress,
       }),

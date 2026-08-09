@@ -352,6 +352,8 @@ async function updateRestoreJob({
       BackupRestoreJob,
       | 'totalDocumentsCount'
       | 'processedDocumentsCount'
+      | 'downloadedBytes'
+      | 'totalBytes'
       | 'restoredDocumentsCount'
       | 'untrashedDocumentsCount'
       | 'skippedDuplicatesCount'

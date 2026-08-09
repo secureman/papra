@@ -6,6 +6,7 @@ import {
   GOOGLE_DRIVE_BACKUP_FILE_MIME_TYPE,
   GOOGLE_DRIVE_DEFAULT_FOLDER_NAME,
   GOOGLE_DRIVE_FILES_ENDPOINT,
+  GOOGLE_DRIVE_REQUEST_TIMEOUT_MS,
   GOOGLE_DRIVE_UPLOAD_ENDPOINT,
 } from './google-drive.constants';
 import { createGoogleDriveOAuthService } from './google-drive.oauth.service';
@@ -37,10 +38,30 @@ export const googleDriveBackupDriverFactory = defineBackupDriver(({ config }) =>
     init: RequestInit;
   }): Promise<Response> {
     const accessToken = await getAccessToken({ refreshToken });
-    const response = await fetch(url, {
-      ...init,
-      headers: { ...(init.headers ?? {}), Authorization: `Bearer ${accessToken}` },
-    });
+
+    const timeoutController = new AbortController();
+    const timeoutId = setTimeout(
+      () => timeoutController.abort(),
+      GOOGLE_DRIVE_REQUEST_TIMEOUT_MS,
+    );
+
+    let response: Response;
+    try {
+      response = await fetch(url, {
+        ...init,
+        headers: { ...(init.headers ?? {}), Authorization: `Bearer ${accessToken}` },
+        signal: timeoutController.signal,
+      });
+    } catch (error) {
+      if (timeoutController.signal.aborted) {
+        logger.error({ url }, 'Google Drive API call timed out');
+        throw createBackupDriverApiError();
+      }
+      throw error;
+    } finally {
+      clearTimeout(timeoutId);
+    }
+
     if (!response.ok) {
       const body = await response.text();
       logger.error({ url, status: response.status, body }, 'Google Drive API call failed');
@@ -135,12 +156,58 @@ export const googleDriveBackupDriverFactory = defineBackupDriver(({ config }) =>
       return { remoteFileId: uploaded.id, remoteFileName: uploaded.name };
     },
 
-    async downloadFile({ credentials, remoteFileId }) {
+    async downloadFile({ credentials, remoteFileId, onProgress }) {
       const refreshToken = credentials.refreshToken!;
       const url = `${GOOGLE_DRIVE_FILES_ENDPOINT}/${remoteFileId}?alt=media`;
       const response = await authorizedFetch({ refreshToken, url, init: { method: 'GET' } });
-      const arrayBuffer = await response.arrayBuffer();
-      return Buffer.from(arrayBuffer);
+
+      const totalBytes = (() => {
+        const header = response.headers.get('content-length');
+        const parsed = header ? Number(header) : Number.NaN;
+        return Number.isFinite(parsed) ? parsed : null;
+      })();
+
+      if (!response.body) {
+        // Some fetch implementations/environments don't expose a streamable
+        // body — fall back to buffering the whole thing at once. No progress
+        // in this case, but the download itself still works.
+        const arrayBuffer = await response.arrayBuffer();
+        return Buffer.from(arrayBuffer);
+      }
+
+      const reader = response.body.getReader();
+      const chunks: Uint8Array[] = [];
+      let downloadedBytes = 0;
+
+      // Per-chunk inactivity timeout rather than a total-duration one — a
+      // large backup file legitimately takes a while, but the connection
+      // genuinely stalling (no bytes at all for a full minute) shouldn't be
+      // able to hang the restore forever with no feedback.
+      const readNextChunk = () =>
+        Promise.race([
+          reader.read(),
+          new Promise<never>((_, reject) => {
+            setTimeout(() => reject(new Error('Download stalled: no data received')), 60_000);
+          }),
+        ]);
+
+      try {
+        for (;;) {
+          const { done, value } = await readNextChunk();
+          if (done) {
+            break;
+          }
+          chunks.push(value);
+          downloadedBytes += value.byteLength;
+          onProgress?.({ downloadedBytes, totalBytes });
+        }
+      } catch (error) {
+        await reader.cancel().catch(() => {});
+        logger.error({ url, downloadedBytes, totalBytes }, 'Google Drive download stalled or failed');
+        throw error;
+      }
+
+      return Buffer.concat(chunks);
     },
 
     async deleteFile({ credentials, remoteFileId }) {

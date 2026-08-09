@@ -58,6 +58,8 @@ export type BackupRestoreJob = {
   status: BackupRestoreJobStatus;
   totalDocumentsCount: number | null;
   processedDocumentsCount: number;
+  downloadedBytes: number | null;
+  totalBytes: number | null;
   restoredDocumentsCount: number | null;
   untrashedDocumentsCount: number | null;
   skippedDuplicatesCount: number | null;

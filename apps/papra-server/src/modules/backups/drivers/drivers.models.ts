@@ -60,6 +60,12 @@ export type BackupDriver = {
     credentials: BackupDriverCredentials;
     settings: BackupDriverSettings;
     remoteFileId: string;
+    // Optional: drivers that can report byte-level progress during download
+    // (streamed HTTP responses with a known Content-Length) should call this
+    // periodically. Drivers that can't (e.g. buffer the whole thing at once
+    // with no size up front) can just ignore it — restore still works, it
+    // just won't show progress during this specific phase.
+    onProgress?: (args: { downloadedBytes: number; totalBytes: number | null }) => void;
   }) => Promise<Buffer>;
 
   deleteFile: (args: {

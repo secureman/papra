@@ -114,20 +114,22 @@ export const BackupsSettingsPage: Component = () => {
 
   return (
     <div class="p-6 max-w-4xl mx-auto flex flex-col gap-6">
-      <div class="flex items-center justify-between">
-        <div>
-          <h2 class="text-lg font-semibold">Backups</h2>
-          <p class="text-sm text-muted-foreground">
-            Automatically back up your documents to Google Drive, WebDAV, or FTP.
-          </p>
+      <div class="flex flex-col gap-4">
+        <div class="flex items-center justify-between gap-4 flex-wrap">
+          <div>
+            <h2 class="text-lg font-semibold">Backups</h2>
+            <p class="text-sm text-muted-foreground">
+              Automatically back up your documents to Google Drive, WebDAV, or FTP.
+            </p>
+          </div>
+
+          <Show when={driversQuery.data?.isConfigured === false}>
+            <Badge variant="destructive">Not configured on the server (BACKUPS_KEK unset)</Badge>
+          </Show>
         </div>
 
-        <Show when={driversQuery.data?.isConfigured === false}>
-          <Badge variant="destructive">Not configured on the server (BACKUPS_KEK unset)</Badge>
-        </Show>
-
         <Show when={driversQuery.data?.isConfigured}>
-          <div class="flex gap-2">
+          <div class="flex gap-2 flex-wrap justify-end">
             <DownloadBackupCopyButton organizationId={organizationId()} />
             <RecoverFromFileDialog organizationId={organizationId()} />
             <AddDestinationDialog

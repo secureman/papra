@@ -1,6 +1,6 @@
 import type { ParentComponent } from 'solid-js';
 import type { BackupRestoreJob } from '../backups.types';
-import { safely } from '@corentinth/chisels';
+import { formatBytes, safely } from '@corentinth/chisels';
 import {
   createContext,
   createEffect,
@@ -50,6 +50,51 @@ function describeOutcome({ job }: { job: BackupRestoreJob }) {
 
 // Rough ETA from average throughput so far — good enough to be useful without
 // pretending to a precision the data doesn't have.
+function formatEtaLabel(remainingMs: number): string {
+  if (remainingMs < 5000) {
+    return 'almost done';
+  }
+  if (remainingMs < 60_000) {
+    return `~${Math.ceil(remainingMs / 1000)}s left`;
+  }
+  if (remainingMs < 60 * 60_000) {
+    return `~${Math.ceil(remainingMs / 60_000)}m left`;
+  }
+  return `~${Math.ceil(remainingMs / (60 * 60_000))}h left`;
+}
+
+// Not every driver reports byte progress (some just buffer the whole download
+// with no size known up front) — in that case this falls back to a plain
+// "still downloading" label with no percent, same as before.
+function estimateDownloadEta({
+  job,
+  now,
+}: {
+  job: BackupRestoreJob;
+  now: number;
+}): { label: string; percent: number | null } {
+  const { downloadedBytes, totalBytes, startedAt } = job;
+
+  if (downloadedBytes === null || downloadedBytes === 0) {
+    return { label: 'Downloading backup…', percent: null };
+  }
+
+  const sizeLabel = totalBytes
+    ? `${formatBytes({ bytes: downloadedBytes })} / ${formatBytes({ bytes: totalBytes })}`
+    : formatBytes({ bytes: downloadedBytes });
+
+  if (!totalBytes || !startedAt) {
+    return { label: `Downloading… ${sizeLabel}`, percent: null };
+  }
+
+  const percent = Math.min(100, Math.round((downloadedBytes / totalBytes) * 100));
+  const elapsedMs = Math.max(1, now - startedAt.getTime());
+  const bytesPerMs = downloadedBytes / elapsedMs;
+  const remainingMs = Math.max(0, (totalBytes - downloadedBytes) / bytesPerMs);
+
+  return { label: `${sizeLabel} · ${formatEtaLabel(remainingMs)}`, percent };
+}
+
 export function estimateRestoreEta({
   job,
   now,
@@ -64,7 +109,7 @@ export function estimateRestoreEta({
     return { label: 'Starting…', percent: null };
   }
   if (job.status === 'downloading') {
-    return { label: 'Downloading backup…', percent: null };
+    return estimateDownloadEta({ job, now });
   }
   if (!total || total === 0) {
     return { label: 'Preparing…', percent: null };
@@ -80,16 +125,7 @@ export function estimateRestoreEta({
   const perDocumentMs = elapsedMs / processed;
   const remainingMs = Math.max(0, (total - processed) * perDocumentMs);
 
-  const etaLabel =
-    remainingMs < 5000
-      ? 'almost done'
-      : remainingMs < 60_000
-        ? `~${Math.ceil(remainingMs / 1000)}s left`
-        : remainingMs < 60 * 60_000
-          ? `~${Math.ceil(remainingMs / 60_000)}m left`
-          : `~${Math.ceil(remainingMs / (60 * 60_000))}h left`;
-
-  return { label: `${processed}/${total} documents · ${etaLabel}`, percent };
+  return { label: `${processed}/${total} documents · ${formatEtaLabel(remainingMs)}`, percent };
 }
 
 type RestoreProgressContextValue = {

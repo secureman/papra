@@ -13,3 +13,8 @@ export const GOOGLE_DRIVE_SCOPES = [
 
 export const GOOGLE_DRIVE_DEFAULT_FOLDER_NAME = 'Papra Backups';
 export const GOOGLE_DRIVE_BACKUP_FILE_MIME_TYPE = 'application/octet-stream';
+
+// A stuck connection with no timeout at all just hangs the whole restore job
+// forever with zero feedback — better to fail loudly after a generous window
+// than sit there indistinguishable from "still working".
+export const GOOGLE_DRIVE_REQUEST_TIMEOUT_MS = 10 * 60 * 1_000;

@@ -29,6 +29,7 @@ import { addIndexesMigration } from './list/0026-add-indexes.migration';
 import { foldersMigration } from './list/0027-folders.migration';
 import { backupsMigration } from './list/0028-backups.migration';
 import { backupRestoreJobsMigration } from './list/0029-backup-restore-jobs.migration';
+import { backupRestoreJobDownloadProgressMigration } from './list/0030-backup-restore-job-download-progress.migration';
 
 export const migrations: Migration[] = [
   initialSchemaSetupMigration,
@@ -60,4 +61,5 @@ export const migrations: Migration[] = [
   foldersMigration,
   backupsMigration,
   backupRestoreJobsMigration,
+  backupRestoreJobDownloadProgressMigration,
 ];

@@ -128,6 +128,14 @@ export const backupRestoreJobsTable = sqliteTable(
     totalDocumentsCount: integer('total_documents_count'),
     processedDocumentsCount: integer('processed_documents_count').notNull().default(0),
 
+    // Byte-level progress for the download phase specifically (before the
+    // manifest is even readable, so document counts aren't known yet) — lets
+    // the client show real progress/ETA instead of a static "Downloading…"
+    // for however long that phase takes. Populated only by drivers that
+    // support streamed progress reporting; stays null otherwise.
+    downloadedBytes: integer('downloaded_bytes'),
+    totalBytes: integer('total_bytes'),
+
     restoredDocumentsCount: integer('restored_documents_count'),
     untrashedDocumentsCount: integer('untrashed_documents_count'),
     skippedDuplicatesCount: integer('skipped_duplicates_count'),
