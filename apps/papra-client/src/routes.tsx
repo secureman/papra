@@ -56,6 +56,7 @@ import { EditWebhookPage } from './modules/webhooks/pages/edit-webhook.page';
 import { WebhooksPage } from './modules/webhooks/pages/webhooks.page';
 import { OrganizationsAutoTaggingSettingsPage } from './modules/organizations/pages/organizations-auto-tagging-settings.page';
 import { BackupsSettingsPage } from './modules/backups/pages/backups.page';
+import { RestoreProgressProvider } from './modules/backups/components/restore-progress.provider';
 
 export const routes: RouteDefinition[] = [
   {
@@ -128,7 +129,11 @@ export const routes: RouteDefinition[] = [
 
               setLatestOrganizationId(params.organizationId);
 
-              return <>{props.children}</>;
+              return (
+                <RestoreProgressProvider organizationId={params.organizationId}>
+                  {props.children}
+                </RestoreProgressProvider>
+              );
             },
             children: [
               {

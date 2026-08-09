@@ -28,6 +28,7 @@ import { addOrganizationSettingsTableMigration } from './list/0025-add-organizat
 import { addIndexesMigration } from './list/0026-add-indexes.migration';
 import { foldersMigration } from './list/0027-folders.migration';
 import { backupsMigration } from './list/0028-backups.migration';
+import { backupRestoreJobsMigration } from './list/0029-backup-restore-jobs.migration';
 
 export const migrations: Migration[] = [
   initialSchemaSetupMigration,
@@ -58,4 +59,5 @@ export const migrations: Migration[] = [
   addIndexesMigration,
   foldersMigration,
   backupsMigration,
+  backupRestoreJobsMigration,
 ];

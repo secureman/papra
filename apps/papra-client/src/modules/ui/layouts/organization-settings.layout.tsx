@@ -2,6 +2,8 @@ import type { ParentComponent } from 'solid-js';
 import { A, useParams } from '@solidjs/router';
 import { useI18n } from '@/modules/i18n/i18n.provider';
 import { SideNav } from '@/modules/ui/components/sidenav';
+import { RestoreProgressIndicator } from '@/modules/backups/components/restore-progress-indicator.component';
+import { RestoreProgressProvider } from '@/modules/backups/components/restore-progress.provider';
 import { Button } from '../components/button';
 import { SidenavLayout } from './sidenav.layout';
 import { UserSettingsDropdown } from '@/modules/users/components/user-settings.component';
@@ -48,32 +50,35 @@ export const OrganizationSettingsLayout: ParentComponent = (props) => {
   ];
 
   return (
-    <SidenavLayout
-      sideNav={() => (
-        <SideNav
-          mainMenu={getNavigationItems()}
-          header={() => (
-            <div class="pl-6 py-3 border-b border-b-border flex items-center gap-1">
-              <Button
-                variant="ghost"
-                size="icon"
-                class="text-muted-foreground"
-                as={A}
-                href={`/organizations/${params.organizationId}`}
-              >
-                <div class="i-tabler-arrow-left size-5" />
-              </Button>
-              <h1 class="text-base font-bold">{t('organization.settings.title')}</h1>
-            </div>
-          )}
-        />
-      )}
-      children={props.children}
-      header={() => (
-        <div class="flex items-center justify-end w-full flex-1">
-          <UserSettingsDropdown />
-        </div>
-      )}
-    />
+    <RestoreProgressProvider organizationId={params.organizationId}>
+      <SidenavLayout
+        sideNav={() => (
+          <SideNav
+            mainMenu={getNavigationItems()}
+            header={() => (
+              <div class="pl-6 py-3 border-b border-b-border flex items-center gap-1">
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  class="text-muted-foreground"
+                  as={A}
+                  href={`/organizations/${params.organizationId}`}
+                >
+                  <div class="i-tabler-arrow-left size-5" />
+                </Button>
+                <h1 class="text-base font-bold">{t('organization.settings.title')}</h1>
+              </div>
+            )}
+          />
+        )}
+        children={props.children}
+        header={() => (
+          <div class="flex items-center justify-end gap-2 w-full flex-1">
+            <RestoreProgressIndicator />
+            <UserSettingsDropdown />
+          </div>
+        )}
+      />
+    </RestoreProgressProvider>
   );
 };

@@ -39,3 +39,30 @@ export type BackupDriverInfo = {
   name: BackupDriverName;
   isConfigured: boolean;
 };
+
+export type BackupRestoreJobStatus =
+  | 'pending'
+  | 'downloading'
+  | 'restoring'
+  | 'succeeded'
+  | 'failed';
+
+export type BackupRestoreJobSource = 'run' | 'remote_file' | 'uploaded_file';
+
+export type BackupRestoreJob = {
+  id: string;
+  organizationId: string;
+  destinationId: string | null;
+  runId: string | null;
+  source: BackupRestoreJobSource;
+  status: BackupRestoreJobStatus;
+  totalDocumentsCount: number | null;
+  processedDocumentsCount: number;
+  restoredDocumentsCount: number | null;
+  untrashedDocumentsCount: number | null;
+  skippedDuplicatesCount: number | null;
+  errorMessage: string | null;
+  startedAt: Date | null;
+  completedAt: Date | null;
+  createdAt: Date;
+};

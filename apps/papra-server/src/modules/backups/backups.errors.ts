@@ -24,6 +24,12 @@ export const createBackupRunNotFoundError = createErrorFactory({
   statusCode: 404,
 });
 
+export const createBackupRestoreJobNotFoundError = createErrorFactory({
+  message: 'Restore job not found',
+  code: 'backups.restore_job_not_found',
+  statusCode: 404,
+});
+
 export const createBackupAlreadyInProgressError = createErrorFactory({
   message: 'A backup is already in progress for this destination',
   code: 'backups.already_in_progress',

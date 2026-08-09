@@ -1,7 +1,11 @@
 import { index, integer, sqliteTable, text } from 'drizzle-orm/sqlite-core';
 import { organizationsTable } from '../organizations/organizations.table';
 import { createPrimaryKeyField, createTimestampColumns } from '../shared/db/columns.helpers';
-import { backupDestinationIdPrefix, backupRunIdPrefix } from './backups.constants';
+import {
+  backupDestinationIdPrefix,
+  backupRestoreJobIdPrefix,
+  backupRunIdPrefix,
+} from './backups.constants';
 
 // One row per configured destination (an org can have several: e.g. Google Drive
 // AND a WebDAV NAS). Holds the encrypted credentials + the per-destination backup
@@ -88,5 +92,54 @@ export const backupRunsTable = sqliteTable(
   (table) => [
     index('backup_runs_destination_id_created_at_index').on(table.destinationId, table.createdAt),
     index('backup_runs_status_index').on(table.status),
+  ],
+);
+
+// One row per restore attempt (from a local run, a remote file browsed directly,
+// or an uploaded file). Runs as a background job so the HTTP request that kicks
+// it off can return immediately instead of blocking for however long the
+// download + re-import takes — the client polls this row for progress/ETA.
+// Lifecycle: pending → downloading (driver-based sources only) → restoring → succeeded | failed.
+export const backupRestoreJobsTable = sqliteTable(
+  'backup_restore_jobs',
+  {
+    ...createPrimaryKeyField({ prefix: backupRestoreJobIdPrefix }),
+    ...createTimestampColumns(),
+
+    organizationId: text('organization_id')
+      .notNull()
+      .references(() => organizationsTable.id, { onDelete: 'cascade', onUpdate: 'cascade' }),
+
+    // Null for an uploaded-file restore (no destination involved at all).
+    destinationId: text('destination_id').references(() => backupDestinationsTable.id, {
+      onDelete: 'set null',
+      onUpdate: 'cascade',
+    }),
+    // Set only when restoring from local run history.
+    runId: text('run_id').references(() => backupRunsTable.id, {
+      onDelete: 'set null',
+      onUpdate: 'cascade',
+    }),
+
+    source: text('source').notNull(), // 'run' | 'remote_file' | 'uploaded_file'
+    status: text('status').notNull(), // 'pending' | 'downloading' | 'restoring' | 'succeeded' | 'failed'
+
+    // Total is unknown until the envelope is downloaded and unpacked, hence nullable.
+    totalDocumentsCount: integer('total_documents_count'),
+    processedDocumentsCount: integer('processed_documents_count').notNull().default(0),
+
+    restoredDocumentsCount: integer('restored_documents_count'),
+    untrashedDocumentsCount: integer('untrashed_documents_count'),
+    skippedDuplicatesCount: integer('skipped_duplicates_count'),
+
+    errorMessage: text('error_message'),
+    // Distinct from createdAt: this is when processing actually began (used for ETA),
+    // not when the row/request was made.
+    startedAt: integer('started_at', { mode: 'timestamp_ms' }),
+    completedAt: integer('completed_at', { mode: 'timestamp_ms' }),
+  },
+  (table) => [
+    index('backup_restore_jobs_organization_id_index').on(table.organizationId),
+    index('backup_restore_jobs_status_index').on(table.status),
   ],
 );

@@ -9,7 +9,11 @@ import { createOrganizationsRepository } from '../organizations/organizations.re
 import { ensureUserIsInOrganization } from '../organizations/organizations.usecases';
 import { getFileStreamFromMultipartForm } from '../shared/streams/file-upload';
 import { validateJsonBody, validateParams } from '../shared/validation/validation';
-import { backupDestinationIdRegex, backupRunIdRegex } from './backups.constants';
+import {
+  backupDestinationIdRegex,
+  backupRestoreJobIdRegex,
+  backupRunIdRegex,
+} from './backups.constants';
 import { createBackupsRepository } from './backups.repository';
 import { createBackupsServices } from './backups.services';
 import {
@@ -17,6 +21,8 @@ import {
   deleteDestinationUsecase,
   deleteRunUsecase,
   downloadBackupCopyUsecase,
+  getActiveRestoreJobUsecase,
+  getRestoreJobUsecase,
   listDestinationsUsecase,
   listRemoteBackupsUsecase,
   listRunsUsecase,
@@ -59,6 +65,8 @@ export function registerBackupsRoutes(context: RouteDefinitionContext) {
   setupRestoreFromUploadedFileRoute(context);
   setupDownloadBackupCopyRoute(context);
   setupVerifyRunRoute(context);
+  setupGetActiveRestoreJobRoute(context);
+  setupGetRestoreJobRoute(context);
   registerGoogleDriveOAuthRoutes(context);
 }
 
@@ -388,7 +396,7 @@ function setupRestoreRunRoute(deps: RouteDefinitionContext) {
         userId,
       });
 
-      return context.json(result);
+      return context.json(result, 202);
     },
   );
 }
@@ -466,7 +474,7 @@ function setupRestoreFromRemoteFileRoute(deps: RouteDefinitionContext) {
         userId,
       });
 
-      return context.json(result);
+      return context.json(result, 202);
     },
   );
 }
@@ -500,12 +508,14 @@ function setupRestoreFromUploadedFileRoute(deps: RouteDefinitionContext) {
       const envelope = Buffer.concat(chunks);
 
       const services = createBackupsServices({ config });
+      const repository = createBackupsRepository({ db });
       const documentsRepository = createDocumentsRepository({ db });
       const foldersRepository = createFoldersRepository({ db });
 
       const result = await restoreFromUploadedFileUsecase({
         config,
         services,
+        repository,
         documentUsecaseDeps: { ...deps },
         documentsRepository,
         foldersRepository,
@@ -514,7 +524,7 @@ function setupRestoreFromUploadedFileRoute(deps: RouteDefinitionContext) {
         userId,
       });
 
-      return context.json(result);
+      return context.json(result, 202);
     },
   );
 }
@@ -595,6 +605,58 @@ function setupVerifyRunRoute({ app, config, db, documentsStorageService }: Route
       });
 
       return context.json(result);
+    },
+  );
+}
+
+// ----- Restore job polling -----
+// Backup restore runs in the background (see restoreRunUsecase et al.), so the
+// client polls these to drive the progress indicator instead of waiting on the
+// original request.
+
+const backupRestoreJobIdSchema = v.pipe(v.string(), v.regex(backupRestoreJobIdRegex));
+
+function setupGetRestoreJobRoute({ app, db }: RouteDefinitionContext) {
+  app.get(
+    '/api/organizations/:organizationId/backups/restore-jobs/job/:jobId',
+    requireAuthentication(),
+    validateParams(
+      v.strictObject({
+        organizationId: organizationIdSchema,
+        jobId: backupRestoreJobIdSchema,
+      }),
+    ),
+    async (context) => {
+      const { userId } = getUser({ context });
+      const { organizationId, jobId } = context.req.valid('param');
+
+      const organizationsRepository = createOrganizationsRepository({ db });
+      await ensureUserIsInOrganization({ userId, organizationId, organizationsRepository });
+
+      const repository = createBackupsRepository({ db });
+      const { job } = await getRestoreJobUsecase({ repository, organizationId, jobId });
+      return context.json({ job });
+    },
+  );
+}
+
+// So a client can discover "is a restore already running?" on page load or
+// after navigating away and back, without needing to have kept the jobId.
+function setupGetActiveRestoreJobRoute({ app, db }: RouteDefinitionContext) {
+  app.get(
+    '/api/organizations/:organizationId/backups/restore-jobs/active',
+    requireAuthentication(),
+    validateParams(v.strictObject({ organizationId: organizationIdSchema })),
+    async (context) => {
+      const { userId } = getUser({ context });
+      const { organizationId } = context.req.valid('param');
+
+      const organizationsRepository = createOrganizationsRepository({ db });
+      await ensureUserIsInOrganization({ userId, organizationId, organizationsRepository });
+
+      const repository = createBackupsRepository({ db });
+      const { job } = await getActiveRestoreJobUsecase({ repository, organizationId });
+      return context.json({ job: job ?? null });
     },
   );
 }

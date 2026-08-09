@@ -39,6 +39,7 @@ import { UserSettingsDropdown } from '@/modules/users/components/user-settings.c
 import { FolderTreeNav } from '@/modules/folders/components/folder-tree-nav.component';
 import { PinnedFoldersNav } from '@/modules/folders/components/pinned-folders-nav.component';
 import { CreateFolderDialog } from '@/modules/folders/components/folder-dialogs.component';
+import { RestoreProgressIndicator } from '@/modules/backups/components/restore-progress-indicator.component';
 
 const UpgradeCTAFooter: Component<{ organizationId: string }> = (props) => {
   const { t } = useI18n();
@@ -351,6 +352,8 @@ export const OrganizationLayout: ParentComponent = (props) => {
             </div>
 
             <div class="flex items-center gap-2">
+              <RestoreProgressIndicator />
+
               <OrganizationLayoutImportButton />
 
               <Show when={hasPermission('bo:access')}>

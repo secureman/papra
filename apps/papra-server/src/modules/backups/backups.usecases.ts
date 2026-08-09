@@ -18,8 +18,11 @@ import { addTagToDocument as addTagToDocumentUsecase } from '../tags/tags.usecas
 import { createTagsRepository } from '../tags/tags.repository';
 import { computeNextScheduledAt, parseScheduleDays } from './backups.models';
 import {
+  backupRestoreJobIdPrefix,
   BACKUP_FILE_EXTENSION,
   BACKUP_FILE_MIME_TYPE,
+  RESTORE_PROGRESS_PERSIST_INTERVAL_MS,
+  STALE_IN_PROGRESS_RESTORE_JOB_TIMEOUT_MS,
   STALE_IN_PROGRESS_RUN_TIMEOUT_MS,
 } from './backups.constants';
 import {
@@ -31,6 +34,7 @@ import {
 import {
   createBackupAlreadyInProgressError,
   createBackupDestinationNotFoundError,
+  createBackupRestoreJobNotFoundError,
   createBackupRunNotFoundError,
   createBackupsNotConfiguredError,
 } from './backups.errors';
@@ -592,6 +596,8 @@ async function restoreFromEnvelopeUsecase({
   organizationId,
   envelope,
   userId,
+  onManifestReady,
+  onProgress,
 }: {
   services: BackupsServices;
   documentUsecaseDeps: import('../app/server.types').GlobalDependencies;
@@ -600,6 +606,12 @@ async function restoreFromEnvelopeUsecase({
   organizationId: string;
   envelope: Buffer;
   userId?: string;
+  // Fired once the manifest is unpacked and the real document count is known
+  // (before the per-document loop starts) — this is what lets the UI switch
+  // from an indeterminate spinner to a real N/total progress bar + ETA.
+  onManifestReady?: (args: { totalDocumentsCount: number }) => void | Promise<void>;
+  // Fired after each manifest entry is processed (restored, skipped, or failed).
+  onProgress?: (args: { processedCount: number; totalCount: number }) => void | Promise<void>;
 }): Promise<{
   restoredDocumentsCount: number;
   untrashedDocumentsCount: number;
@@ -630,6 +642,8 @@ async function restoreFromEnvelopeUsecase({
       }[];
     }
   ).documents;
+
+  await onManifestReady?.({ totalDocumentsCount: manifestDocs.length });
 
   const createDocument = createDocumentCreationUsecase({ ...documentUsecaseDeps });
   const tagsRepository = createTagsRepository({ db: documentUsecaseDeps.db });
@@ -813,8 +827,15 @@ async function restoreFromEnvelopeUsecase({
   let restoredCount = 0;
   let untrashedCount = 0;
   let skippedCount = 0;
+  let processedCount = 0;
 
   for (const entry of manifestDocs) {
+    // Reported regardless of how this entry turns out (restored, skipped,
+    // untrashed, missing file, or failed) — it tracks loop progress for the
+    // ETA, not restore outcomes.
+    processedCount += 1;
+    await onProgress?.({ processedCount, totalCount: manifestDocs.length });
+
     const matchingFileKey = [...unpackedFiles.keys()].find((name) =>
       name.startsWith(`${entry.id}-`),
     );
@@ -822,6 +843,12 @@ async function restoreFromEnvelopeUsecase({
       continue;
     }
     const content = unpackedFiles.get(matchingFileKey)!;
+
+    // Resolved once per entry, up front, so it's available regardless of
+    // which branch below actually runs — restore should put a document back
+    // where the backup says it belonged even if the document itself already
+    // existed (matched by hash) rather than being freshly created.
+    const folderId = await resolveOrRecreateFolderId(entry);
 
     // On a fresh install this will always be undefined (empty documents table),
     // so every manifest entry goes through createDocument below. On a
@@ -843,6 +870,17 @@ async function restoreFromEnvelopeUsecase({
             documentsRepository,
             eventServices: documentUsecaseDeps.eventServices,
           });
+          // restoreDocument only undoes the trash — it doesn't know about the
+          // backup's folder placement, so that has to be applied separately
+          // (moveDocuments requires isDeleted: false, which is why this runs
+          // after restoreDocument rather than before it).
+          if ((existing.folderId ?? null) !== (folderId ?? null)) {
+            await documentsRepository.moveDocuments({
+              documentIds: [existing.id],
+              organizationId,
+              folderId: folderId ?? null,
+            });
+          }
           await applyMetadata({ documentId: existing.id, entry });
           await applyTagsToDocument({ documentId: existing.id, tags: entry.tags });
           untrashedCount += 1;
@@ -855,11 +893,28 @@ async function restoreFromEnvelopeUsecase({
         continue;
       }
 
+      // Already present and active — nothing to restore content-wise, but
+      // still worth reconciling folder placement with what the backup
+      // recorded (e.g. the document was moved after the backup was taken).
+      if ((existing.folderId ?? null) !== (folderId ?? null)) {
+        try {
+          await documentsRepository.moveDocuments({
+            documentIds: [existing.id],
+            organizationId,
+            folderId: folderId ?? null,
+          });
+        } catch (error) {
+          logger.error(
+            { error, documentId: existing.id },
+            'Failed to restore folder placement for already-present document',
+          );
+        }
+      }
+
       skippedCount += 1;
       continue;
     }
 
-    const folderId = await resolveOrRecreateFolderId(entry);
     const fileStream: Readable = NodeReadable.from(content);
 
     try {
@@ -890,6 +945,128 @@ async function restoreFromEnvelopeUsecase({
   };
 }
 
+// ----- Background restore job plumbing -----
+// A restore run against Google Drive/WebDAV/FTP can easily take longer than a
+// typical HTTP request timeout once you count the download plus re-importing
+// every document. Rather than holding the request open (and the client having
+// to raise its timeout to match), the route creates a job row and returns
+// immediately; this reporter wires the restore core's callbacks to persist
+// progress onto that row so the client can poll it and show a real ETA.
+function createRestoreProgressReporter({
+  repository,
+  jobId,
+}: {
+  repository: BackupsRepository;
+  jobId: string;
+}) {
+  let lastPersistedAt = 0;
+  let lastPersistedCount = -1;
+
+  const onDownloadStart = async (): Promise<void> => {
+    await repository.updateRestoreJob({
+      jobId,
+      status: 'downloading',
+      fields: { startedAt: new Date() },
+    });
+  };
+
+  const onManifestReady = async ({
+    totalDocumentsCount,
+  }: {
+    totalDocumentsCount: number;
+  }): Promise<void> => {
+    await repository.updateRestoreJob({
+      jobId,
+      status: 'restoring',
+      // startedAt may already be set (driver-based restore set it at download
+      // start) — re-setting it here covers the uploaded-file case, where
+      // there's no download phase and this is the first progress write.
+      fields: { totalDocumentsCount, startedAt: new Date() },
+    });
+  };
+
+  const onProgress = async ({
+    processedCount,
+    totalCount,
+  }: {
+    processedCount: number;
+    totalCount: number;
+  }): Promise<void> => {
+    const now = Date.now();
+    const isLastDocument = processedCount >= totalCount;
+    // Throttle DB writes on large restores — the UI only needs to feel live,
+    // not see every single document. Always persist the final one though, so
+    // the progress bar doesn't visibly stall short of 100%.
+    if (!isLastDocument && now - lastPersistedAt < RESTORE_PROGRESS_PERSIST_INTERVAL_MS) {
+      return;
+    }
+    if (processedCount === lastPersistedCount) {
+      return;
+    }
+    lastPersistedAt = now;
+    lastPersistedCount = processedCount;
+    await repository.updateRestoreJob({ jobId, fields: { processedDocumentsCount: processedCount } });
+  };
+
+  return { onDownloadStart, onManifestReady, onProgress };
+}
+
+type RestoreOutcome = {
+  restoredDocumentsCount: number;
+  untrashedDocumentsCount: number;
+  skippedDuplicatesCount: number;
+  totalDocumentsCount: number;
+};
+
+// Fire-and-forget: runs `execute` (whichever restore flavor the caller needs),
+// wiring progress into the job row and settling it to succeeded/failed. Never
+// throws — errors are captured onto the job row instead, since there is no
+// HTTP response left to send by the time this runs.
+async function runRestoreJobPipeline({
+  repository,
+  jobId,
+  logger: providedLogger = logger,
+  execute,
+}: {
+  repository: BackupsRepository;
+  jobId: string;
+  logger?: Logger;
+  execute: (
+    reporter: ReturnType<typeof createRestoreProgressReporter>,
+  ) => Promise<RestoreOutcome>;
+}): Promise<void> {
+  const reporter = createRestoreProgressReporter({ repository, jobId });
+
+  try {
+    const result = await execute(reporter);
+
+    await repository.updateRestoreJob({
+      jobId,
+      status: 'succeeded',
+      fields: {
+        restoredDocumentsCount: result.restoredDocumentsCount,
+        untrashedDocumentsCount: result.untrashedDocumentsCount,
+        skippedDuplicatesCount: result.skippedDuplicatesCount,
+        totalDocumentsCount: result.totalDocumentsCount,
+        processedDocumentsCount: result.totalDocumentsCount,
+        completedAt: new Date(),
+      },
+    });
+
+    providedLogger.info({ jobId, ...result }, 'Restore job completed');
+  } catch (error) {
+    providedLogger.error({ error, jobId }, 'Restore job failed');
+    await repository.updateRestoreJob({
+      jobId,
+      status: 'failed',
+      fields: {
+        errorMessage: (error as Error)?.message?.slice(0, 500) ?? 'Unknown error',
+        completedAt: new Date(),
+      },
+    });
+  }
+}
+
 // Driver-based restore: destination downloads the envelope file, then hands off
 // to the shared core above.
 async function restoreArchiveUsecase({
@@ -901,6 +1078,9 @@ async function restoreArchiveUsecase({
   destination,
   remoteFileId,
   userId,
+  onDownloadStart,
+  onManifestReady,
+  onProgress,
 }: {
   services: BackupsServices;
   documentUsecaseDeps: import('../app/server.types').GlobalDependencies;
@@ -910,12 +1090,16 @@ async function restoreArchiveUsecase({
   destination: import('./backups.types').BackupDestination;
   remoteFileId: string;
   userId?: string;
+  onDownloadStart?: () => void | Promise<void>;
+  onManifestReady?: (args: { totalDocumentsCount: number }) => void | Promise<void>;
+  onProgress?: (args: { processedCount: number; totalCount: number }) => void | Promise<void>;
 }) {
   const encryption = services.requireEncryption();
   const credentials = unwrapCredentials({ encryption, wrapped: destination.encryptedCredentials });
   const settings = JSON.parse(destination.settingsJson) as Record<string, unknown>;
   const driver = services.getDriver(destination.driver);
 
+  await onDownloadStart?.();
   const envelope = await driver.downloadFile({ credentials, settings, remoteFileId });
 
   return restoreFromEnvelopeUsecase({
@@ -926,6 +1110,8 @@ async function restoreArchiveUsecase({
     organizationId,
     envelope,
     userId,
+    onManifestReady,
+    onProgress,
   });
 }
 
@@ -979,33 +1165,65 @@ export async function downloadBackupCopyUsecase({
 export async function restoreFromUploadedFileUsecase({
   config,
   services,
+  repository,
   documentUsecaseDeps,
   documentsRepository,
   foldersRepository,
   organizationId,
   envelope,
   userId,
+  logger: providedLogger = logger,
 }: {
   config: Config;
   services: BackupsServices;
+  repository: BackupsRepository;
   documentUsecaseDeps: import('../app/server.types').GlobalDependencies;
   documentsRepository: DocumentsRepository;
   foldersRepository: FoldersRepository;
   organizationId: string;
   envelope: Buffer;
   userId?: string;
-}) {
+  logger?: Logger;
+}): Promise<{ jobId: string }> {
   assertBackupsConfigured({ config });
 
-  return restoreFromEnvelopeUsecase({
-    services,
-    documentUsecaseDeps,
-    documentsRepository,
-    foldersRepository,
+  await repository.markStaleInProgressRestoreJobsAsFailed({
     organizationId,
-    envelope,
-    userId,
+    staleBefore: new Date(Date.now() - STALE_IN_PROGRESS_RESTORE_JOB_TIMEOUT_MS),
+    errorMessage: 'Restore marked as failed because the previous job did not complete.',
   });
+
+  const { job } = await repository.createRestoreJob({
+    job: {
+      id: generateId({ prefix: backupRestoreJobIdPrefix }),
+      organizationId,
+      destinationId: null,
+      runId: null,
+      source: 'uploaded_file',
+      status: 'pending',
+    },
+  });
+
+  // Fire and forget: the route returns immediately, the client polls the job.
+  void runRestoreJobPipeline({
+    repository,
+    jobId: job.id,
+    logger: providedLogger,
+    execute: ({ onManifestReady, onProgress }) =>
+      restoreFromEnvelopeUsecase({
+        services,
+        documentUsecaseDeps,
+        documentsRepository,
+        foldersRepository,
+        organizationId,
+        envelope,
+        userId,
+        onManifestReady,
+        onProgress,
+      }),
+  });
+
+  return { jobId: job.id };
 }
 
 // ----- Restore from local run history (normal case: same install that took the backup) -----
@@ -1021,6 +1239,7 @@ export async function restoreRunUsecase({
   destinationId,
   runId,
   userId,
+  logger: providedLogger = logger,
 }: {
   config: Config;
   services: BackupsServices;
@@ -1032,7 +1251,8 @@ export async function restoreRunUsecase({
   destinationId: string;
   runId: string;
   userId?: string;
-}) {
+  logger?: Logger;
+}): Promise<{ jobId: string }> {
   assertBackupsConfigured({ config });
 
   const { run } = await repository.getRunById({ runId, organizationId });
@@ -1044,16 +1264,47 @@ export async function restoreRunUsecase({
     throw createBackupDestinationNotFoundError();
   }
 
-  return restoreArchiveUsecase({
-    services,
-    documentUsecaseDeps,
-    documentsRepository,
-    foldersRepository,
+  await repository.markStaleInProgressRestoreJobsAsFailed({
     organizationId,
-    destination,
-    remoteFileId: run.remoteFileId,
-    userId,
+    staleBefore: new Date(Date.now() - STALE_IN_PROGRESS_RESTORE_JOB_TIMEOUT_MS),
+    errorMessage: 'Restore marked as failed because the previous job did not complete.',
   });
+
+  const { job } = await repository.createRestoreJob({
+    job: {
+      id: generateId({ prefix: backupRestoreJobIdPrefix }),
+      organizationId,
+      destinationId,
+      runId,
+      source: 'run',
+      status: 'pending',
+    },
+  });
+
+  const remoteFileId = run.remoteFileId;
+
+  // Fire and forget: the route returns immediately, the client polls the job.
+  void runRestoreJobPipeline({
+    repository,
+    jobId: job.id,
+    logger: providedLogger,
+    execute: ({ onDownloadStart, onManifestReady, onProgress }) =>
+      restoreArchiveUsecase({
+        services,
+        documentUsecaseDeps,
+        documentsRepository,
+        foldersRepository,
+        organizationId,
+        destination,
+        remoteFileId,
+        userId,
+        onDownloadStart,
+        onManifestReady,
+        onProgress,
+      }),
+  });
+
+  return { jobId: job.id };
 }
 
 // ----- Disaster recovery: list + restore backups that exist on a destination -----
@@ -1108,6 +1359,7 @@ export async function restoreFromRemoteFileUsecase({
   destinationId,
   remoteFileId,
   userId,
+  logger: providedLogger = logger,
 }: {
   config: Config;
   services: BackupsServices;
@@ -1119,7 +1371,8 @@ export async function restoreFromRemoteFileUsecase({
   destinationId: string;
   remoteFileId: string;
   userId?: string;
-}) {
+  logger?: Logger;
+}): Promise<{ jobId: string }> {
   assertBackupsConfigured({ config });
 
   const { destination } = await repository.getDestinationById({ destinationId, organizationId });
@@ -1127,16 +1380,77 @@ export async function restoreFromRemoteFileUsecase({
     throw createBackupDestinationNotFoundError();
   }
 
-  return restoreArchiveUsecase({
-    services,
-    documentUsecaseDeps,
-    documentsRepository,
-    foldersRepository,
+  await repository.markStaleInProgressRestoreJobsAsFailed({
     organizationId,
-    destination,
-    remoteFileId,
-    userId,
+    staleBefore: new Date(Date.now() - STALE_IN_PROGRESS_RESTORE_JOB_TIMEOUT_MS),
+    errorMessage: 'Restore marked as failed because the previous job did not complete.',
   });
+
+  const { job } = await repository.createRestoreJob({
+    job: {
+      id: generateId({ prefix: backupRestoreJobIdPrefix }),
+      organizationId,
+      destinationId,
+      runId: null,
+      source: 'remote_file',
+      status: 'pending',
+    },
+  });
+
+  // Fire and forget: the route returns immediately, the client polls the job.
+  void runRestoreJobPipeline({
+    repository,
+    jobId: job.id,
+    logger: providedLogger,
+    execute: ({ onDownloadStart, onManifestReady, onProgress }) =>
+      restoreArchiveUsecase({
+        services,
+        documentUsecaseDeps,
+        documentsRepository,
+        foldersRepository,
+        organizationId,
+        destination,
+        remoteFileId,
+        userId,
+        onDownloadStart,
+        onManifestReady,
+        onProgress,
+      }),
+  });
+
+  return { jobId: job.id };
+}
+
+// ----- Restore job status (polled by the client for progress/ETA) -----
+
+export async function getRestoreJobUsecase({
+  repository,
+  organizationId,
+  jobId,
+}: {
+  repository: BackupsRepository;
+  organizationId: string;
+  jobId: string;
+}): Promise<{ job: import('./backups.types').BackupRestoreJob }> {
+  const { job } = await repository.getRestoreJobById({ jobId, organizationId });
+  if (!job) {
+    throw createBackupRestoreJobNotFoundError();
+  }
+  return { job };
+}
+
+// Lets the client find "is anything restoring right now?" on page load/nav
+// without having to have kept a jobId around — e.g. the user kicked off a
+// restore, closed the tab, and came back later.
+export async function getActiveRestoreJobUsecase({
+  repository,
+  organizationId,
+}: {
+  repository: BackupsRepository;
+  organizationId: string;
+}): Promise<{ job: import('./backups.types').BackupRestoreJob | undefined }> {
+  const { job } = await repository.getActiveRestoreJobForOrganization({ organizationId });
+  return { job };
 }
 
 // ----- Scheduler tick (called by tasks/backup-scheduler-tick.task.ts) -----

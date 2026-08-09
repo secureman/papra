@@ -3,6 +3,7 @@ import type {
   BackupDestination,
   BackupDriverInfo,
   BackupDriverName,
+  BackupRestoreJob,
   BackupRun,
   BackupSchedule,
 } from './backups.types';
@@ -25,6 +26,15 @@ function coerceRunDates(r: AsDto<BackupRun>): BackupRun {
     ...r,
     createdAt: new Date(r.createdAt),
     completedAt: r.completedAt ? new Date(r.completedAt) : null,
+  };
+}
+
+function coerceRestoreJobDates(j: AsDto<BackupRestoreJob>): BackupRestoreJob {
+  return {
+    ...j,
+    startedAt: j.startedAt ? new Date(j.startedAt) : null,
+    completedAt: j.completedAt ? new Date(j.completedAt) : null,
+    createdAt: new Date(j.createdAt),
   };
 }
 
@@ -208,16 +218,10 @@ export async function restoreFromRemoteFile({
   destinationId: string;
   remoteFileId: string;
 }) {
-  return apiClient<{
-    restoredDocumentsCount: number;
-    untrashedDocumentsCount: number;
-    skippedDuplicatesCount: number;
-    totalDocumentsCount: number;
-  }>({
+  return apiClient<{ jobId: string }>({
     path: `${DESTINATIONS_PATH(organizationId)}/${destinationId}/remote-files/restore`,
     method: 'POST',
     body: { remoteFileId },
-    timeout: 600000, // 10 minutes for large restores
   });
 }
 
@@ -230,20 +234,16 @@ export async function restoreBackupRun({
   destinationId: string;
   runId: string;
 }) {
-  return apiClient<{
-    restoredDocumentsCount: number;
-    untrashedDocumentsCount: number;
-    skippedDuplicatesCount: number;
-    totalDocumentsCount: number;
-  }>({
+  return apiClient<{ jobId: string }>({
     path: `${DESTINATIONS_PATH(organizationId)}/${destinationId}/runs/${runId}/restore`,
     method: 'POST',
-    timeout: 600000, // 10 minutes for large restores
   });
 }
 
 // No destination, no credentials, no connection of any kind — you already have
-// the backup file (copied off wherever) and just upload it directly.
+// the backup file (copied off wherever) and just upload it directly. The
+// upload itself is still a normal request (the file has to reach the server
+// either way); only the re-import step afterwards runs as a background job.
 export async function restoreFromUploadedFile({
   organizationId,
   file,
@@ -251,16 +251,11 @@ export async function restoreFromUploadedFile({
   organizationId: string;
   file: File;
 }) {
-  return apiClient<{
-    restoredDocumentsCount: number;
-    untrashedDocumentsCount: number;
-    skippedDuplicatesCount: number;
-    totalDocumentsCount: number;
-  }>({
+  return apiClient<{ jobId: string }>({
     path: `/api/organizations/${organizationId}/backups/recover-from-file`,
     method: 'POST',
     body: getFormData({ file }),
-    timeout: 600000, // 10 minutes for large restores
+    timeout: 120000, // just needs to cover the upload itself, not the restore anymore
   });
 }
 
@@ -294,4 +289,30 @@ export async function verifyBackupRun({
     path: `${DESTINATIONS_PATH(organizationId)}/${destinationId}/runs/${runId}/verify`,
     method: 'POST',
   });
+}
+
+// ----- Restore job polling (drives the global progress indicator) -----
+
+export async function fetchRestoreJob({
+  organizationId,
+  jobId,
+}: {
+  organizationId: string;
+  jobId: string;
+}) {
+  const { job } = await apiClient<{ job: AsDto<BackupRestoreJob> }>({
+    path: `/api/organizations/${organizationId}/backups/restore-jobs/job/${jobId}`,
+    method: 'GET',
+  });
+  return { job: coerceRestoreJobDates(job) };
+}
+
+// Lets the indicator pick up an in-progress restore on page load or after
+// navigating back, without needing to have kept the jobId in memory.
+export async function fetchActiveRestoreJob({ organizationId }: { organizationId: string }) {
+  const { job } = await apiClient<{ job: AsDto<BackupRestoreJob> | null }>({
+    path: `/api/organizations/${organizationId}/backups/restore-jobs/active`,
+    method: 'GET',
+  });
+  return { job: job ? coerceRestoreJobDates(job) : null };
 }

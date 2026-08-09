@@ -37,6 +37,7 @@ import {
   TableRow,
 } from '@/modules/ui/components/table';
 import { TextField, TextFieldLabel, TextFieldRoot } from '@/modules/ui/components/textfield';
+import { useRestoreProgress } from '../components/restore-progress.provider';
 import {
   createBackupDestination,
   deleteBackupDestination,
@@ -201,6 +202,7 @@ const DownloadBackupCopyButton: Component<{ organizationId: string }> = (props) 
 const RecoverFromFileDialog: Component<{ organizationId: string }> = (props) => {
   const { getErrorMessage } = useI18nApiErrors();
   const { confirm } = useConfirmModal();
+  const { registerRestoreJob } = useRestoreProgress();
   const [isOpen, setIsOpen] = createSignal(false);
   const [file, setFile] = createSignal<File | null>(null);
   const [isRestoring, setIsRestoring] = createSignal(false);
@@ -225,15 +227,8 @@ const RecoverFromFileDialog: Component<{ organizationId: string }> = (props) => 
       createToast({ type: 'error', message: getErrorMessage({ error }) });
       return;
     }
-    createToast({
-      type: 'success',
-      message:
-        `Restored ${result.restoredDocumentsCount}/${result.totalDocumentsCount} documents` +
-        (result.untrashedDocumentsCount ? ` (${result.untrashedDocumentsCount} untrashed)` : '') +
-        (result.skippedDuplicatesCount
-          ? ` (${result.skippedDuplicatesCount} already present)`
-          : ''),
-    });
+    registerRestoreJob({ organizationId: props.organizationId, jobId: result.jobId });
+    createToast({ type: 'success', message: 'Restore started — see the progress indicator in the header' });
     setIsOpen(false);
     setFile(null);
   };
@@ -745,6 +740,8 @@ const DestinationCard: Component<{
     }
   };
 
+  const { registerRestoreJob } = useRestoreProgress();
+
   const handleRestoreRun = async (run: BackupRun) => {
     const isConfirmed = await props.confirm({
       title: 'Restore this backup?',
@@ -754,14 +751,6 @@ const DestinationCard: Component<{
     if (!isConfirmed) return;
     setRestoringRunId(run.id);
 
-    const restoreToastId = `restore-${run.id}`;
-    createToast({
-      type: 'loading',
-      id: restoreToastId,
-      message: `Restoring backup (${run.documentsCount ?? '—'} documents). This may take several minutes...`,
-      duration: Infinity, // Don't auto-dismiss
-    });
-
     const [result, error] = await safely(
       restoreBackupRun({
         organizationId: props.organizationId,
@@ -770,24 +759,17 @@ const DestinationCard: Component<{
       }),
     );
 
-    // Dismiss the loading toast
-    toast.dismiss(restoreToastId);
-
     setRestoringRunId(null);
     if (error) {
       createToast({ type: 'error', message: props.getErrorMessage({ error }) });
       return;
     }
-    createToast({
-      type: 'success',
-      message:
-        `Restored ${result.restoredDocumentsCount}/${result.totalDocumentsCount} documents` +
-        (result.untrashedDocumentsCount ? ` (${result.untrashedDocumentsCount} untrashed)` : '') +
-        (result.skippedDuplicatesCount
-          ? ` (${result.skippedDuplicatesCount} already present)`
-          : ''),
-    });
-    void invalidateRuns();
+
+    // The restore itself now runs in the background — the cog-wheel indicator
+    // in the header takes over from here (progress, ETA, and the completion
+    // toast), so there's nothing left to await on this page.
+    registerRestoreJob({ organizationId: props.organizationId, jobId: result.jobId });
+    createToast({ type: 'success', message: 'Restore started — see the progress indicator in the header' });
   };
 
   return (
@@ -959,6 +941,7 @@ const RecoverFromDestinationDialog: Component<{
 }> = (props) => {
   const [isOpen, setIsOpen] = createSignal(false);
   const [isRestoring, setIsRestoring] = createSignal<string | null>(null);
+  const { registerRestoreJob } = useRestoreProgress();
 
   const remoteFilesQuery = useQuery(() => ({
     queryKey: [
@@ -998,15 +981,8 @@ const RecoverFromDestinationDialog: Component<{
       createToast({ type: 'error', message: props.getErrorMessage({ error }) });
       return;
     }
-    createToast({
-      type: 'success',
-      message:
-        `Restored ${result.restoredDocumentsCount}/${result.totalDocumentsCount} documents` +
-        (result.untrashedDocumentsCount ? ` (${result.untrashedDocumentsCount} untrashed)` : '') +
-        (result.skippedDuplicatesCount
-          ? ` (${result.skippedDuplicatesCount} already present)`
-          : ''),
-    });
+    registerRestoreJob({ organizationId: props.organizationId, jobId: result.jobId });
+    createToast({ type: 'success', message: 'Restore started — see the progress indicator in the header' });
     props.onRestored();
     setIsOpen(false);
   };

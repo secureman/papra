@@ -1,15 +1,22 @@
 import type { Database } from '../app/database/database.types';
 import type {
   BackupDestination,
+  BackupRestoreJob,
+  BackupRestoreJobStatus,
   BackupRun,
   BackupRunStatus,
   DbInsertableBackupDestination,
+  DbInsertableBackupRestoreJob,
   DbInsertableBackupRun,
 } from './backups.types';
 import { injectArguments } from '@corentinth/chisels';
 import { and, desc, eq, inArray, isNotNull, lte } from 'drizzle-orm';
 import { omitUndefined } from '../shared/objects';
-import { backupDestinationsTable, backupRunsTable } from './backups.table';
+import {
+  backupDestinationsTable,
+  backupRestoreJobsTable,
+  backupRunsTable,
+} from './backups.table';
 
 export type BackupsRepository = ReturnType<typeof createBackupsRepository>;
 
@@ -30,6 +37,12 @@ export function createBackupsRepository({ db }: { db: Database }) {
       updateRunStatus,
       markStaleInProgressRunsAsFailed,
       getInProgressRunForDestination,
+      // Restore jobs
+      createRestoreJob,
+      getRestoreJobById,
+      updateRestoreJob,
+      getActiveRestoreJobForOrganization,
+      markStaleInProgressRestoreJobsAsFailed,
     },
     { db },
   );
@@ -284,5 +297,122 @@ async function markStaleInProgressRunsAsFailed({
       ),
     )
     .returning({ id: backupRunsTable.id });
+  return { markedCount: result.length };
+}
+
+// ----- Restore jobs -----
+// Same fire-and-forget-then-poll shape as backup runs above, but for the
+// restore direction: a job row is created up front so the HTTP handler can
+// return instantly with its id, and the background pipeline keeps writing
+// progress to it as it works through the manifest.
+
+async function createRestoreJob({
+  job,
+  db,
+}: {
+  job: DbInsertableBackupRestoreJob;
+  db: Database;
+}): Promise<{ job: BackupRestoreJob }> {
+  const [inserted] = await db.insert(backupRestoreJobsTable).values(job).returning();
+  return { job: inserted! };
+}
+
+async function getRestoreJobById({
+  jobId,
+  organizationId,
+  db,
+}: {
+  jobId: string;
+  organizationId: string;
+  db: Database;
+}): Promise<{ job: BackupRestoreJob | undefined }> {
+  const [job] = await db
+    .select()
+    .from(backupRestoreJobsTable)
+    .where(
+      and(
+        eq(backupRestoreJobsTable.id, jobId),
+        eq(backupRestoreJobsTable.organizationId, organizationId),
+      ),
+    )
+    .limit(1);
+  return { job };
+}
+
+async function updateRestoreJob({
+  jobId,
+  status,
+  fields = {},
+  db,
+}: {
+  jobId: string;
+  status?: BackupRestoreJobStatus;
+  fields?: Partial<
+    Pick<
+      BackupRestoreJob,
+      | 'totalDocumentsCount'
+      | 'processedDocumentsCount'
+      | 'restoredDocumentsCount'
+      | 'untrashedDocumentsCount'
+      | 'skippedDuplicatesCount'
+      | 'errorMessage'
+      | 'startedAt'
+      | 'completedAt'
+    >
+  >;
+  db: Database;
+}): Promise<void> {
+  await db
+    .update(backupRestoreJobsTable)
+    .set({ ...(status ? { status } : {}), ...omitUndefined(fields), updatedAt: new Date() })
+    .where(eq(backupRestoreJobsTable.id, jobId));
+}
+
+// Powers the cog-wheel indicator: whatever page the user is on, or after a
+// refresh/navigation away and back, this is how the UI finds "oh, there's
+// still a restore running" without having to have kept the jobId around.
+async function getActiveRestoreJobForOrganization({
+  organizationId,
+  db,
+}: {
+  organizationId: string;
+  db: Database;
+}): Promise<{ job: BackupRestoreJob | undefined }> {
+  const [job] = await db
+    .select()
+    .from(backupRestoreJobsTable)
+    .where(
+      and(
+        eq(backupRestoreJobsTable.organizationId, organizationId),
+        inArray(backupRestoreJobsTable.status, ['pending', 'downloading', 'restoring']),
+      ),
+    )
+    .orderBy(desc(backupRestoreJobsTable.createdAt))
+    .limit(1);
+  return { job };
+}
+
+async function markStaleInProgressRestoreJobsAsFailed({
+  organizationId,
+  staleBefore,
+  errorMessage,
+  db,
+}: {
+  organizationId: string;
+  staleBefore: Date;
+  errorMessage: string;
+  db: Database;
+}): Promise<{ markedCount: number }> {
+  const result = await db
+    .update(backupRestoreJobsTable)
+    .set({ status: 'failed', errorMessage, completedAt: new Date() })
+    .where(
+      and(
+        eq(backupRestoreJobsTable.organizationId, organizationId),
+        inArray(backupRestoreJobsTable.status, ['pending', 'downloading', 'restoring']),
+        lte(backupRestoreJobsTable.createdAt, staleBefore),
+      ),
+    )
+    .returning({ id: backupRestoreJobsTable.id });
   return { markedCount: result.length };
 }

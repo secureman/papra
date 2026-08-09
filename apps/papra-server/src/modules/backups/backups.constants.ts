@@ -8,12 +8,23 @@ export const backupDestinationIdRegex = createPrefixedIdRegex({
 export const backupRunIdPrefix = 'bkrun';
 export const backupRunIdRegex = createPrefixedIdRegex({ prefix: backupRunIdPrefix });
 
+export const backupRestoreJobIdPrefix = 'bkrst';
+export const backupRestoreJobIdRegex = createPrefixedIdRegex({
+  prefix: backupRestoreJobIdPrefix,
+});
+
 export const BACKUP_FILE_EXTENSION = '.papra-backup';
 export const BACKUP_FILE_MIME_TYPE = 'application/octet-stream';
 
 // Defensive cleanup: if the process dies mid-run, this stale row would otherwise
 // block new runs forever.
 export const STALE_IN_PROGRESS_RUN_TIMEOUT_MS = 24 * 60 * 60 * 1_000;
+export const STALE_IN_PROGRESS_RESTORE_JOB_TIMEOUT_MS = 24 * 60 * 60 * 1_000;
+
+// How often the restore pipeline persists processedDocumentsCount to the DB.
+// Every single document would hammer sqlite on a large restore for no real UX
+// gain; this keeps writes cheap while still feeling live to a polling client.
+export const RESTORE_PROGRESS_PERSIST_INTERVAL_MS = 700;
 
 // How often the scheduler tick task wakes up to check whether any destination's
 // schedule is due. 15 minutes gives ±15min precision on the chosen time, which is
