@@ -29,15 +29,19 @@ WORKDIR /app
 ENV PNPM_CONFIG_STRICT_PEER_DEPENDENCIES=false
 
 # Copy package files for better layer caching
+# NOTE: papra-client's package.json is needed here too — it's a sibling app,
+# not a dependency of app-server, so it's invisible to the app-server install
+# filter unless explicitly listed.
 COPY pnpm-workspace.yaml package.json pnpm-lock.yaml ./
 COPY apps/papra-server/package.json ./apps/papra-server/
+COPY apps/papra-client/package.json ./apps/papra-client/
 COPY packages/ ./packages/
 
 # Install dependencies
 # Using --ignore-scripts to avoid postinstall issues
 # Note: Using without --frozen-lockfile for now due to network/timeouts
 RUN pnpm config set fetch-timeout 300000
-RUN pnpm install --filter=@papra/app-server... --frozen-lockfile --network-concurrency=4
+RUN pnpm install --filter=@papra/app-server... --filter=@papra/app-client... --frozen-lockfile --network-concurrency=4
 
 # Copy all source files
 COPY . .
@@ -46,6 +50,13 @@ COPY . .
 RUN cd apps/papra-server && \
     pnpm build && \
     pnpm esbuild --bundle src/scripts/migrate-up.script.ts --platform=node --packages=external --format=esm --outfile=dist/scripts/migrate-up.script.js --minify --alias:@papra/std=../../packages/std/src/index.ts
+
+# Build the client — this is what was missing. Without it, the server has
+# nothing to serve at "/" and serveStatic falls back to a bare JSON error for
+# every page (`root path './public' is not found`). Vite's default output dir
+# is "dist", which is renamed to "public" on copy below to match what the
+# server's servePublicDir config actually looks for.
+RUN cd apps/papra-client && pnpm build
 
 # =============================================================================
 # Runtime stage - Minimal production image
@@ -78,6 +89,10 @@ COPY --from=builder --chown=nodejs:nodejs /app/packages ./packages
 COPY --from=builder --chown=nodejs:nodejs /app/node_modules ./node_modules
 COPY --from=builder --chown=nodejs:nodejs /app/package.json ./
 COPY --from=builder --chown=nodejs:nodejs /app/pnpm-workspace.yaml ./
+# The client build — this is what makes servePublicDir actually have
+# something to serve. Destination name must be "public", matching what
+# SERVER_SERVE_PUBLIC_DIR expects relative to the server's CWD.
+COPY --from=builder --chown=nodejs:nodejs /app/apps/papra-client/dist ./apps/papra-server/public
 
 # Switch to non-root user
 # Rebuild any native modules (.node addons) against the
@@ -98,5 +113,14 @@ EXPOSE 1221
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
     CMD node -e "require('http').get('http://localhost:1221/api/health',r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))"
 
-# Run the server (Node.js 22 has stable Temporal-adjacent APIs used here)
-CMD ["node", "/app/apps/papra-server/dist/index.js"]
+# Run migrations, then the server. This is what was missing before — the
+# migrate-up script was being built (see builder stage above) but nothing
+# ever actually ran it, so every fresh container started against an empty
+# database ("no such table: auth_sessions" etc). Matches papra-hq's own
+# "start:with-migrations" package.json script (migrate:up:prod && start),
+# just spelled out directly since this image doesn't have that script's
+# workspace context at runtime. Deliberately NOT changing WORKDIR here (it
+# stays "/app", same as before) — absolute paths instead, so nothing about
+# how the app resolves its own relative paths (e.g. the default sqlite file
+# location) changes as a side effect of this fix.
+CMD ["sh", "-c", "node /app/apps/papra-server/dist/scripts/migrate-up.script.js && node /app/apps/papra-server/dist/index.js"]
