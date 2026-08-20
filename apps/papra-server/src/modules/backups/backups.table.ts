@@ -1,4 +1,5 @@
-import { index, integer, sqliteTable, text } from 'drizzle-orm/sqlite-core';
+import { index, integer, sqliteTable, text, uniqueIndex } from 'drizzle-orm/sqlite-core';
+import { sql } from 'drizzle-orm';
 import { organizationsTable } from '../organizations/organizations.table';
 import { createPrimaryKeyField, createTimestampColumns } from '../shared/db/columns.helpers';
 import {
@@ -92,6 +93,11 @@ export const backupRunsTable = sqliteTable(
   (table) => [
     index('backup_runs_destination_id_created_at_index').on(table.destinationId, table.createdAt),
     index('backup_runs_status_index').on(table.status),
+    // Enforces "at most one in-progress run per destination" at the database
+    // level — the insert in createRun relies on this being the guard.
+    uniqueIndex('backup_runs_single_in_progress_per_destination_index')
+      .on(table.destinationId)
+      .where(sql`${table.status} IN ('pending', 'uploading')`),
   ],
 );
 

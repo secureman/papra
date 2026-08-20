@@ -35,8 +35,8 @@ export function createBackupsRepository({ db }: { db: Database }) {
       getRunById,
       listRunsByDestinationId,
       updateRunStatus,
+      deleteRun,
       markStaleInProgressRunsAsFailed,
-      getInProgressRunForDestination,
       // Restore jobs
       createRestoreJob,
       getRestoreJobById,
@@ -184,9 +184,17 @@ async function createRun({
 }: {
   run: DbInsertableBackupRun;
   db: Database;
-}): Promise<{ run: BackupRun }> {
-  const [inserted] = await db.insert(backupRunsTable).values(run).returning();
-  return { run: inserted! };
+}): Promise<{ run: BackupRun | undefined }> {
+  // The insert itself is the concurrency guard: a partial unique index on
+  // (destination_id) WHERE status IN ('pending','uploading') makes a second
+  // simultaneous insert a no-op. Returns undefined when the destination
+  // already has an in-progress run.
+  const [inserted] = await db
+    .insert(backupRunsTable)
+    .values(run)
+    .onConflictDoNothing()
+    .returning();
+  return { run: inserted };
 }
 
 async function getRunById({
@@ -251,24 +259,18 @@ async function updateRunStatus({
     .where(eq(backupRunsTable.id, runId));
 }
 
-async function getInProgressRunForDestination({
-  destinationId,
+async function deleteRun({
+  runId,
   db,
 }: {
-  destinationId: string;
+  runId: string;
   db: Database;
-}): Promise<{ run: BackupRun | undefined }> {
-  const [run] = await db
-    .select()
-    .from(backupRunsTable)
-    .where(
-      and(
-        eq(backupRunsTable.destinationId, destinationId),
-        inArray(backupRunsTable.status, ['pending', 'uploading']),
-      ),
-    )
-    .limit(1);
-  return { run };
+}): Promise<{ deleted: boolean }> {
+  const result = await db
+    .delete(backupRunsTable)
+    .where(eq(backupRunsTable.id, runId))
+    .returning({ id: backupRunsTable.id });
+  return { deleted: result.length > 0 };
 }
 
 // Marks runs stuck in pending/uploading past the stale threshold as failed.

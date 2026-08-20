@@ -267,11 +267,9 @@ export async function runBackupUsecase({
     errorMessage: 'Backup marked as failed because the previous run did not complete.',
   });
 
-  const { run: inProgress } = await repository.getInProgressRunForDestination({ destinationId });
-  if (inProgress) {
-    throw createBackupAlreadyInProgressError();
-  }
-
+  // The insert itself is the concurrency guard: the partial unique index on
+  // (destination_id) WHERE status IN ('pending','uploading') turns a second
+  // simultaneous insert into a no-op, so there's no check-then-insert race.
   const { run } = await repository.createRun({
     run: {
       id: generateId({ prefix: 'bkrun' }),
@@ -281,6 +279,10 @@ export async function runBackupUsecase({
       status: 'pending',
     },
   });
+
+  if (!run) {
+    throw createBackupAlreadyInProgressError();
+  }
 
   // Fire and forget: the route returns immediately, the client polls run history.
   void runBackupPipeline({
@@ -547,6 +549,9 @@ export async function deleteRunUsecase({
   if (!run) {
     throw createBackupRunNotFoundError();
   }
+  if (run.destinationId !== destinationId) {
+    throw createBackupRunNotFoundError();
+  }
 
   if (run.remoteFileId) {
     const { destination } = await repository.getDestinationById({ destinationId, organizationId });
@@ -568,11 +573,13 @@ export async function deleteRunUsecase({
     }
   }
 
-  await repository.updateRunStatus({
-    runId,
-    status: 'failed',
-    fields: { errorMessage: 'Deleted by user', completedAt: new Date() },
-  });
+  // Actually delete the run row (restore jobs referencing it get their run_id
+  // set to null by the FK). The remote file deletion above is best-effort —
+  // the local record is removed regardless.
+  const { deleted } = await repository.deleteRun({ runId });
+  if (!deleted) {
+    throw createBackupRunNotFoundError();
+  }
   return { deleted: true };
 }
 

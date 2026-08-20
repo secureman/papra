@@ -30,6 +30,7 @@ import { foldersMigration } from './list/0027-folders.migration';
 import { backupsMigration } from './list/0028-backups.migration';
 import { backupRestoreJobsMigration } from './list/0029-backup-restore-jobs.migration';
 import { backupRestoreJobDownloadProgressMigration } from './list/0030-backup-restore-job-download-progress.migration';
+import { backupRunsSingleInProgressMigration } from './list/0031-backup-runs-single-in-progress.migration';
 
 export const migrations: Migration[] = [
   initialSchemaSetupMigration,
@@ -62,4 +63,5 @@ export const migrations: Migration[] = [
   backupsMigration,
   backupRestoreJobsMigration,
   backupRestoreJobDownloadProgressMigration,
+  backupRunsSingleInProgressMigration,
 ];
