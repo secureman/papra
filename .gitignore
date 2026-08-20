@@ -49,3 +49,6 @@ ingestion
 .opencode
 AGENTS.md
 .env
+
+# Editor/backup artifacts
+*.bak
