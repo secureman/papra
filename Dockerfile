@@ -90,9 +90,12 @@ COPY --from=builder --chown=nodejs:nodejs /app/node_modules ./node_modules
 COPY --from=builder --chown=nodejs:nodejs /app/package.json ./
 COPY --from=builder --chown=nodejs:nodejs /app/pnpm-workspace.yaml ./
 # The client build — this is what makes servePublicDir actually have
-# something to serve. Destination name must be "public", matching what
-# SERVER_SERVE_PUBLIC_DIR expects relative to the server's CWD.
-COPY --from=builder --chown=nodejs:nodejs /app/apps/papra-client/dist ./apps/papra-server/public
+# something to serve. Server source resolves this as root: './public',
+# relative to process.cwd() — and CWD here is "/app" (WORKDIR, never
+# changed), NOT "/app/apps/papra-server". So this has to land at exactly
+# "/app/public", not nested under apps/papra-server, or serveStatic still
+# won't find it despite the file technically being in the image.
+COPY --from=builder --chown=nodejs:nodejs /app/apps/papra-client/dist ./public
 
 # Switch to non-root user
 # Rebuild any native modules (.node addons) against the
