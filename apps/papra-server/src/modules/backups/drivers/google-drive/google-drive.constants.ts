@@ -18,3 +18,9 @@ export const GOOGLE_DRIVE_BACKUP_FILE_MIME_TYPE = 'application/octet-stream';
 // forever with zero feedback — better to fail loudly after a generous window
 // than sit there indistinguishable from "still working".
 export const GOOGLE_DRIVE_REQUEST_TIMEOUT_MS = 10 * 60 * 1_000;
+
+// Shorter timeout for the OAuth token endpoint: a hung token request blocks
+// the whole backup run (refresh happens before anything else), and 10 minutes
+// of silence is indistinguishable from "still working" — fail after 30s so the
+// run gets marked failed with a real message instead of hanging in "pending".
+export const GOOGLE_DRIVE_OAUTH_REQUEST_TIMEOUT_MS = 30 * 1_000;
