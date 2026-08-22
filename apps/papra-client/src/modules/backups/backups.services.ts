@@ -179,6 +179,25 @@ export async function runBackupNow({
   });
 }
 
+// Claims the envelope of a local-destination run once it's sitting at
+// 'ready_for_download' — one-shot, same request shape as fetchBackupCopy.
+export async function fetchReadyBackupRun({
+  organizationId,
+  destinationId,
+  runId,
+}: {
+  organizationId: string;
+  destinationId: string;
+  runId: string;
+}) {
+  const blob = await apiClient({
+    method: 'GET',
+    path: `${DESTINATIONS_PATH(organizationId)}/${destinationId}/runs/${runId}/download`,
+    responseType: 'blob',
+  });
+  return blob;
+}
+
 export async function deleteBackupRun({
   organizationId,
   destinationId,

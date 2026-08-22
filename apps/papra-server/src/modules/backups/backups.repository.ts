@@ -32,6 +32,7 @@ export function createBackupsRepository({ db }: { db: Database }) {
       getDueScheduledDestinations,
       // Runs
       createRun,
+      updateRunProgress,
       getRunById,
       listRunsByDestinationId,
       updateRunStatus,
@@ -247,6 +248,10 @@ async function updateRunStatus({
       | 'remoteFileName'
       | 'documentsCount'
       | 'totalSizeBytes'
+      | 'totalRawBytes'
+      | 'processedDocumentsCount'
+      | 'processedBytes'
+      | 'uploadedBytes'
       | 'errorMessage'
       | 'completedAt'
     >
@@ -257,6 +262,22 @@ async function updateRunStatus({
     .update(backupRunsTable)
     .set({ status, ...omitUndefined(fields) })
     .where(eq(backupRunsTable.id, runId));
+}
+
+// Progress-only write, no status change — used from the tight loops inside
+// the packaging/upload phases where a write happens every N milliseconds and
+// re-stating `status` each time would just be noise (and risk racing a
+// concurrent status transition written from elsewhere in the pipeline).
+async function updateRunProgress({
+  runId,
+  fields,
+  db,
+}: {
+  runId: string;
+  fields: Partial<Pick<BackupRun, 'processedDocumentsCount' | 'processedBytes' | 'uploadedBytes'>>;
+  db: Database;
+}): Promise<void> {
+  await db.update(backupRunsTable).set(omitUndefined(fields)).where(eq(backupRunsTable.id, runId));
 }
 
 async function deleteRun({

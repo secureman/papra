@@ -79,13 +79,30 @@ export const backupRunsTable = sqliteTable(
       .references(() => organizationsTable.id, { onDelete: 'cascade', onUpdate: 'cascade' }),
 
     trigger: text('trigger').notNull(), // 'manual' | 'scheduled'
-    status: text('status').notNull(), // 'pending' | 'uploading' | 'succeeded' | 'failed'
+    // 'pending' | 'packaging' | 'uploading' | 'ready_for_download' | 'succeeded' | 'failed'
+    // 'packaging': reading/taring/encrypting documents (processedBytes/documentsCount track this).
+    // 'uploading': driver upload in progress (uploadedBytes tracks this).
+    // 'ready_for_download': local-folder destinations only — envelope is built,
+    // waiting on the browser to save it (see local driver notes).
+    status: text('status').notNull(),
 
     remoteFileId: text('remote_file_id'),
     remoteFileName: text('remote_file_name'),
 
     documentsCount: integer('documents_count'),
     totalSizeBytes: integer('total_size_bytes'),
+
+    // ----- Real progress, not just the status word above -----
+    // Packaging phase: documentsCount + totalRawBytes are known upfront (a
+    // cheap DB query before any file is touched), so processed*/totalRawBytes
+    // gives a real percentage while reading+taring+encrypting documents.
+    processedDocumentsCount: integer('processed_documents_count').notNull().default(0),
+    processedBytes: integer('processed_bytes'),
+    totalRawBytes: integer('total_raw_bytes'),
+    // Upload phase: bytes sent to the driver so far, out of totalSizeBytes
+    // (the final compressed+encrypted envelope size, set once packaging ends —
+    // unchanged from what this column already meant).
+    uploadedBytes: integer('uploaded_bytes'),
 
     errorMessage: text('error_message'),
     completedAt: integer('completed_at', { mode: 'timestamp_ms' }),
@@ -97,7 +114,7 @@ export const backupRunsTable = sqliteTable(
     // level — the insert in createRun relies on this being the guard.
     uniqueIndex('backup_runs_single_in_progress_per_destination_index')
       .on(table.destinationId)
-      .where(sql`${table.status} IN ('pending', 'uploading')`),
+      .where(sql`${table.status} IN ('pending', 'packaging', 'uploading')`),
   ],
 );
 

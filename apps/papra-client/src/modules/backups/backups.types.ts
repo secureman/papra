@@ -20,7 +20,7 @@ export type BackupDestination = {
   createdAt: Date;
 };
 
-export type BackupRunStatus = 'pending' | 'uploading' | 'succeeded' | 'failed';
+export type BackupRunStatus = 'pending' | 'packaging' | 'uploading' | 'ready_for_download' | 'succeeded' | 'failed';
 
 export type BackupRun = {
   id: string;
@@ -30,6 +30,12 @@ export type BackupRun = {
   remoteFileName: string | null;
   documentsCount: number | null;
   totalSizeBytes: number | null;
+  // Packaging-phase progress (reading/taring/encrypting documents).
+  processedDocumentsCount: number;
+  processedBytes: number | null;
+  totalRawBytes: number | null;
+  // Upload-phase progress (bytes sent to the driver so far).
+  uploadedBytes: number | null;
   errorMessage: string | null;
   createdAt: Date;
   completedAt: Date | null;

@@ -3,10 +3,10 @@ import type { BackupDestination, BackupDriverName, BackupRun } from '../backups.
 import { safely } from '@corentinth/chisels';
 import { useParams, useSearchParams } from '@solidjs/router';
 import { useQuery, useQueryClient } from '@tanstack/solid-query';
-import { createMemo, createSignal, For, Show, onCleanup } from 'solid-js';
+import { createMemo, createEffect, createSignal, For, on, Show, onCleanup } from 'solid-js';
 import { useI18nApiErrors } from '@/modules/shared/http/composables/i18n-api-errors';
 import { useConfirmModal } from '@/modules/shared/confirm';
-import { downloadFile } from '@/modules/shared/files/download';
+import { downloadFile, saveBlobToDisk } from '@/modules/shared/files/download';
 import { Button } from '@/modules/ui/components/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/modules/ui/components/card';
 import { Badge } from '@/modules/ui/components/badge';
@@ -26,6 +26,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/modules/ui/components/select';
+import { Progress } from '@/modules/ui/components/progress';
 import { createToast, toast } from '@/modules/ui/components/sonner';
 import { Switch, SwitchControl, SwitchThumb } from '@/modules/ui/components/switch';
 import {
@@ -44,6 +45,7 @@ import {
   deleteBackupRun,
   fetchBackupCopy,
   fetchBackupDrivers,
+  fetchReadyBackupRun,
   listBackupDestinations,
   listBackupRuns,
   listRemoteBackupFiles,
@@ -81,10 +83,50 @@ function formatBytes(bytes: number | null): string {
 
 const STATUS_VARIANT: Record<BackupRun['status'], 'default' | 'secondary' | 'destructive'> = {
   pending: 'secondary',
+  packaging: 'secondary',
   uploading: 'secondary',
+  ready_for_download: 'secondary',
   succeeded: 'default',
   failed: 'destructive',
 };
+
+const STATUS_LABEL: Record<BackupRun['status'], string> = {
+  pending: 'pending',
+  packaging: 'packaging',
+  uploading: 'uploading',
+  ready_for_download: 'saving to your device…',
+  succeeded: 'succeeded',
+  failed: 'failed',
+};
+
+// Real percent, not just a status word: packaging (reading/taring/encrypting
+// documents) and uploading (sending the finished envelope to the driver) are
+// two separate phases with their own totals, so each gets its own bar rather
+// than faking a single 0-100 number across both.
+function describeRunProgress(run: BackupRun): { label: string; percent: number | null } {
+  if (run.status === 'packaging') {
+    const total = run.totalRawBytes;
+    const processed = run.processedBytes ?? 0;
+    if (!total) {
+      return { label: `Reading documents… ${run.processedDocumentsCount}/${run.documentsCount ?? '?'}`, percent: null };
+    }
+    const percent = Math.min(100, Math.round((processed / total) * 100));
+    return {
+      label: `Packaging… ${formatBytes(processed)} / ${formatBytes(total)} (${run.processedDocumentsCount}/${run.documentsCount ?? '?'} documents)`,
+      percent,
+    };
+  }
+  if (run.status === 'uploading') {
+    const total = run.totalSizeBytes;
+    const uploaded = run.uploadedBytes;
+    if (!total || uploaded === null) {
+      return { label: 'Uploading…', percent: null };
+    }
+    const percent = Math.min(100, Math.round((uploaded / total) * 100));
+    return { label: `Uploading… ${formatBytes(uploaded)} / ${formatBytes(total)}`, percent };
+  }
+  return { label: STATUS_LABEL[run.status], percent: null };
+}
 
 export const BackupsSettingsPage: Component = () => {
   const params = useParams();
@@ -555,6 +597,57 @@ const DestinationCard: Component<{
       listBackupRuns({ organizationId: props.organizationId, destinationId: props.destination.id }),
   }));
 
+  // A 'local' destination's run sits at 'ready_for_download' once the server
+  // has the envelope built — nothing more happens until this claims it. Track
+  // which run ids we've already started claiming so a re-poll while the fetch
+  // is still in flight doesn't fire it a second time.
+  const claimedRunIds = new Set<string>();
+  createEffect(on(
+    () => runsQuery.data?.runs,
+    (runs) => {
+      if (props.destination.driver !== 'local' || !runs) {
+        return;
+      }
+      for (const run of runs) {
+        if (run.status !== 'ready_for_download' || claimedRunIds.has(run.id)) {
+          continue;
+        }
+        claimedRunIds.add(run.id);
+        void (async () => {
+          const [blob, error] = await safely(
+            fetchReadyBackupRun({
+              organizationId: props.organizationId,
+              destinationId: props.destination.id,
+              runId: run.id,
+            }),
+          );
+          if (error) {
+            createToast({ type: 'error', message: props.getErrorMessage({ error }) });
+            await refetchRuns();
+            return;
+          }
+          const fileName = run.remoteFileName
+            ?? `papra-backup-${new Date().toISOString().replace(/[:.]/g, '-')}.papra-backup`;
+          const [saveResult, saveError] = await safely(saveBlobToDisk({ blob, fileName }));
+          if (saveError) {
+            createToast({ type: 'error', message: props.getErrorMessage({ error: saveError }) });
+            await refetchRuns();
+            return;
+          }
+          if (saveResult.cancelled) {
+            createToast({
+              type: 'info',
+              message: 'Download cancelled — the backup was already built though, so it\'s marked as done. Run it again if you still want a copy.',
+            });
+          } else {
+            createToast({ type: 'success', message: 'Backup saved' });
+          }
+          await refetchRuns();
+        })();
+      }
+    },
+  ));
+
   const invalidateRuns = () =>
     queryClient.invalidateQueries({
       queryKey: [
@@ -624,7 +717,8 @@ const DestinationCard: Component<{
 
   const hasPendingOrUploadingRuns = () => {
     const runs = runsQuery.data?.runs ?? [];
-    return runs.some((run) => run.status === 'pending' || run.status === 'uploading');
+    return runs.some((run) =>
+      run.status === 'pending' || run.status === 'packaging' || run.status === 'uploading' || run.status === 'ready_for_download');
   };
 
   const handleRunNow = async () => {
@@ -806,19 +900,28 @@ const DestinationCard: Component<{
       </CardHeader>
       <CardContent class="flex flex-col gap-4">
         <div class="flex flex-col gap-2">
-          <Switch
-            class="flex items-center gap-3"
-            checked={isScheduleEnabled()}
-            onChange={(checked) => {
-              setIsScheduleEnabled(checked);
-              saveSchedule({ isEnabled: checked });
-            }}
+          <Show
+            when={props.destination.driver !== 'local'}
+            fallback={
+              <p class="text-sm text-muted-foreground">
+                Local folder backups save straight to your browser, so they can't run on a schedule — use "Run backup now" instead.
+              </p>
+            }
           >
-            <SwitchControl>
-              <SwitchThumb />
-            </SwitchControl>
-            <span class="text-sm font-medium">Automatic backups</span>
-          </Switch>
+            <Switch
+              class="flex items-center gap-3"
+              checked={isScheduleEnabled()}
+              onChange={(checked) => {
+                setIsScheduleEnabled(checked);
+                saveSchedule({ isEnabled: checked });
+              }}
+            >
+              <SwitchControl>
+                <SwitchThumb />
+              </SwitchControl>
+              <span class="text-sm font-medium">Automatic backups</span>
+            </Switch>
+          </Show>
 
           <Show when={isScheduleEnabled()}>
             <div class="flex flex-wrap items-center gap-2 pl-2">
@@ -886,7 +989,23 @@ const DestinationCard: Component<{
                 <TableRow>
                   <TableCell>{run.createdAt.toLocaleString()}</TableCell>
                   <TableCell>
-                    <Badge variant={STATUS_VARIANT[run.status]}>{run.status}</Badge>
+                    <Badge variant={STATUS_VARIANT[run.status]}>{STATUS_LABEL[run.status]}</Badge>
+                    <Show when={run.status === 'packaging' || run.status === 'uploading'}>
+                      {(() => {
+                        const progress = describeRunProgress(run);
+                        return (
+                          <div class="mt-1 max-w-48">
+                            <Show
+                              when={progress.percent !== null}
+                              fallback={<p class="text-xs text-muted-foreground">{progress.label}</p>}
+                            >
+                              <Progress value={progress.percent ?? 0} minValue={0} maxValue={100} />
+                              <p class="text-xs text-muted-foreground mt-0.5">{progress.label}</p>
+                            </Show>
+                          </div>
+                        );
+                      })()}
+                    </Show>
                     <Show when={run.status === 'failed' && run.errorMessage}>
                       <p class="text-xs text-destructive mt-1">{run.errorMessage}</p>
                     </Show>

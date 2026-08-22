@@ -21,6 +21,7 @@ import {
   backupRestoreJobIdPrefix,
   BACKUP_FILE_EXTENSION,
   BACKUP_FILE_MIME_TYPE,
+  BACKUP_PROGRESS_PERSIST_INTERVAL_MS,
   RESTORE_PROGRESS_PERSIST_INTERVAL_MS,
   STALE_IN_PROGRESS_RESTORE_JOB_TIMEOUT_MS,
   STALE_IN_PROGRESS_RUN_TIMEOUT_MS,
@@ -34,6 +35,7 @@ import {
 import {
   createBackupAlreadyInProgressError,
   createBackupDestinationNotFoundError,
+  createBackupLocalScheduleNotSupportedError,
   createBackupRestoreJobNotFoundError,
   createBackupRunNotFoundError,
   createBackupsNotConfiguredError,
@@ -162,6 +164,10 @@ export async function updateDestinationScheduleUsecase({
   const { destination } = await repository.getDestinationById({ destinationId, organizationId });
   if (!destination) {
     throw createBackupDestinationNotFoundError();
+  }
+
+  if (schedule.isEnabled && destination.driver === 'local') {
+    throw createBackupLocalScheduleNotSupportedError();
   }
 
   const nextScheduledAt = computeNextScheduledAt({ schedule, from: new Date() });
@@ -380,6 +386,8 @@ async function buildEncryptedBackupEnvelope({
   dek,
   db,
   logger,
+  onStart,
+  onProgress,
 }: {
   organizationId: string;
   documentsRepository: DocumentsRepository;
@@ -389,13 +397,28 @@ async function buildEncryptedBackupEnvelope({
   dek: Buffer;
   db: import('../app/database/database.types').Database;
   logger: Logger;
+  // Fired once, right after the document list + sizes are known, before any
+  // file is actually read — lets the caller persist real totals immediately
+  // instead of the run sitting at "pending" with no numbers for however long
+  // the fetch-and-tar loop below takes.
+  onStart?: (args: { documentsCount: number; totalRawBytes: number }) => void | Promise<void>;
+  // Fired after each document is read (successfully or not — skipped docs
+  // still count toward "processed" so the bar keeps moving and reaches 100%).
+  onProgress?: (args: {
+    processedDocumentsCount: number;
+    processedBytes: number;
+  }) => void | Promise<void>;
 }): Promise<{ envelope: Buffer; documentsCount: number }> {
   const { documents: docs } =
     await documentsRepository.getAllOrganizationUndeletedDocumentsForBackup({ organizationId });
 
-  const files: { name: string; content: Buffer }[] = [];
+  const totalRawBytes = docs.reduce((sum, d) => sum + (d.originalSize ?? 0), 0);
+  await onStart?.({ documentsCount: docs.length, totalRawBytes });
 
-  for (const doc of docs) {
+  const files: { name: string; content: Buffer }[] = [];
+  let processedBytes = 0;
+
+  for (const [index, doc] of docs.entries()) {
     try {
       const { fileStream } = await documentsStorageService.getFileStream({
         storageKey: doc.originalStorageKey,
@@ -407,13 +430,19 @@ async function buildEncryptedBackupEnvelope({
       for await (const chunk of fileStream) {
         chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
       }
+      const content = Buffer.concat(chunks);
       files.push({
         name: `${doc.id}-${doc.originalName.replace(/[^\w.-]/g, '_')}`,
-        content: Buffer.concat(chunks),
+        content,
       });
+      processedBytes += content.length;
     } catch (error) {
       logger.error({ error, documentId: doc.id }, 'Failed to fetch document for backup; skipping');
+      // Still count the (unread) doc's expected size so the bar doesn't stall
+      // short of 100% just because one document failed to fetch.
+      processedBytes += doc.originalSize ?? 0;
     }
+    await onProgress?.({ processedDocumentsCount: index + 1, processedBytes });
   }
 
   const manifest = await buildBackupManifest({ organizationId, docs, db });
@@ -426,6 +455,61 @@ async function buildEncryptedBackupEnvelope({
   });
 
   return { envelope, documentsCount: docs.length };
+}
+
+// Mirrors createRestoreProgressReporter below: wires the packaging/upload
+// callbacks in buildEncryptedBackupEnvelope + driver.uploadFile onto the run
+// row, throttled, so the client's poll actually gets a moving percentage
+// instead of a status word that sits still for however long each phase takes.
+function createBackupProgressReporter({
+  repository,
+  runId,
+}: {
+  repository: BackupsRepository;
+  runId: string;
+}) {
+  let lastPackagingPersistedAt = 0;
+  let lastUploadPersistedAt = 0;
+
+  const onPackagingStart = async ({
+    documentsCount,
+    totalRawBytes,
+  }: {
+    documentsCount: number;
+    totalRawBytes: number;
+  }): Promise<void> => {
+    await repository.updateRunStatus({
+      runId,
+      status: 'packaging',
+      fields: { documentsCount, totalRawBytes, processedDocumentsCount: 0, processedBytes: 0 },
+    });
+  };
+
+  const onPackagingProgress = ({
+    processedDocumentsCount,
+    processedBytes,
+  }: {
+    processedDocumentsCount: number;
+    processedBytes: number;
+  }): void => {
+    const now = Date.now();
+    if (now - lastPackagingPersistedAt < BACKUP_PROGRESS_PERSIST_INTERVAL_MS) {
+      return;
+    }
+    lastPackagingPersistedAt = now;
+    void repository.updateRunProgress({ runId, fields: { processedDocumentsCount, processedBytes } });
+  };
+
+  const onUploadProgress = ({ uploadedBytes }: { uploadedBytes: number }): void => {
+    const now = Date.now();
+    if (now - lastUploadPersistedAt < BACKUP_PROGRESS_PERSIST_INTERVAL_MS) {
+      return;
+    }
+    lastUploadPersistedAt = now;
+    void repository.updateRunProgress({ runId, fields: { uploadedBytes } });
+  };
+
+  return { onPackagingStart, onPackagingProgress, onUploadProgress };
 }
 
 async function runBackupPipeline({
@@ -461,6 +545,8 @@ async function runBackupPipeline({
   const dek = encryption.unwrapWithKek({ wrapped: destination.wrappedBackupKey });
   const settings = JSON.parse(destination.settingsJson) as Record<string, unknown>;
   const driver = services.getDriver(destination.driver);
+  const isLocalDestination = destination.driver === 'local';
+  const progress = createBackupProgressReporter({ repository, runId });
 
   try {
     const { envelope, documentsCount } = await buildEncryptedBackupEnvelope({
@@ -472,12 +558,45 @@ async function runBackupPipeline({
       dek,
       db,
       logger,
+      onStart: progress.onPackagingStart,
+      onProgress: progress.onPackagingProgress,
     });
+
+    const fileName = `papra-backup-${organizationId.slice(-6)}-${new Date().toISOString().replace(/[:.]/g, '-')}${BACKUP_FILE_EXTENSION}`;
+
+    // Local destinations have nowhere server-side to upload to — hand the
+    // envelope to the in-memory delivery service and wait for the client's
+    // browser to claim it, instead of calling driver.uploadFile at all.
+    if (isLocalDestination) {
+      await repository.updateRunStatus({
+        runId,
+        status: 'ready_for_download',
+        fields: { documentsCount, totalSizeBytes: envelope.length },
+      });
+      services.localDelivery.holdForDownload({
+        runId,
+        envelope,
+        fileName,
+        organizationId,
+        onExpire: () => {
+          void repository.updateRunStatus({
+            runId,
+            status: 'failed',
+            fields: {
+              errorMessage: 'Backup was ready but never downloaded — open the backups page and run it again.',
+              completedAt: new Date(),
+            },
+          });
+        },
+      });
+      logger.info({ runId, destinationId, size: envelope.length, documentsCount }, 'Backup ready for client download');
+      return;
+    }
 
     await repository.updateRunStatus({
       runId,
       status: 'uploading',
-      fields: { documentsCount, totalSizeBytes: envelope.length },
+      fields: { documentsCount, totalSizeBytes: envelope.length, uploadedBytes: 0 },
     });
 
     let folderRef = destination.remoteFolderRef;
@@ -487,7 +606,6 @@ async function runBackupPipeline({
       await repository.updateDestination({ destinationId, fields: { remoteFolderRef: folderRef } });
     }
 
-    const fileName = `papra-backup-${organizationId.slice(-6)}-${new Date().toISOString().replace(/[:.]/g, '-')}${BACKUP_FILE_EXTENSION}`;
     const uploaded = await driver.uploadFile({
       credentials,
       settings,
@@ -495,6 +613,7 @@ async function runBackupPipeline({
       fileName,
       mimeType: BACKUP_FILE_MIME_TYPE,
       content: envelope,
+      onProgress: progress.onUploadProgress,
     });
 
     await repository.updateRunStatus({
@@ -503,6 +622,7 @@ async function runBackupPipeline({
       fields: {
         remoteFileId: uploaded.remoteFileId,
         remoteFileName: uploaded.remoteFileName,
+        uploadedBytes: envelope.length,
         completedAt: new Date(),
       },
     });
@@ -571,6 +691,13 @@ export async function deleteRunUsecase({
         );
       }
     }
+  }
+
+  // A local-destination run sitting at 'ready_for_download' still has its
+  // envelope held in memory (see backups.local-delivery.service) — free it
+  // instead of leaking until the TTL fires.
+  if (run.status === 'ready_for_download') {
+    services.localDelivery.discard({ runId });
   }
 
   // Actually delete the run row (restore jobs referencing it get their run_id
@@ -1191,6 +1318,42 @@ export async function downloadBackupCopyUsecase({
   return { envelope, fileName, documentsCount };
 }
 
+// ----- Claim the envelope of a 'local' destination run that's sitting at
+// 'ready_for_download' (see runBackupPipeline + backups.local-delivery.service).
+// One-shot: the envelope is gone from memory after this resolves, whether or
+// not the caller actually finishes streaming it to the response. -----
+export async function downloadReadyBackupRunUsecase({
+  services,
+  repository,
+  organizationId,
+  runId,
+}: {
+  services: BackupsServices;
+  repository: BackupsRepository;
+  organizationId: string;
+  runId: string;
+}): Promise<{ envelope: Buffer; fileName: string }> {
+  const { run } = await repository.getRunById({ runId, organizationId });
+  if (!run || run.status !== 'ready_for_download') {
+    throw createBackupRunNotFoundError();
+  }
+
+  const claimed = services.localDelivery.takeReadyDownload({ runId, organizationId });
+  if (!claimed) {
+    // Expired (10 min TTL) or already downloaded by another tab/request.
+    throw createBackupRunNotFoundError();
+  }
+
+  await repository.updateRunStatus({
+    runId,
+    status: 'succeeded',
+    fields: { remoteFileName: claimed.fileName, completedAt: new Date() },
+  });
+  await repository.updateDestination({ destinationId: run.destinationId, fields: { lastRunAt: new Date() } });
+
+  return { envelope: claimed.envelope, fileName: claimed.fileName };
+}
+
 // ----- Restore directly from an uploaded file — no destination, no driver, no
 // connection to anything at all. You already have the file (copied off your
 // phone, an SD card, wherever); this just needs it + your BACKUPS_KEK. -----
@@ -1518,6 +1681,12 @@ export async function runDueScheduledBackupsUsecase({
   let triggeredCount = 0;
 
   for (const destination of destinations) {
+    // Defense in depth: updateDestinationScheduleUsecase already refuses to
+    // enable scheduling on a local destination, but skip here too in case a
+    // row was ever left over from before that guard existed.
+    if (destination.driver === 'local') {
+      continue;
+    }
     try {
       await runBackupUsecase({
         config,

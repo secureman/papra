@@ -25,6 +25,7 @@ export const STALE_IN_PROGRESS_RESTORE_JOB_TIMEOUT_MS = 24 * 60 * 60 * 1_000;
 // Every single document would hammer sqlite on a large restore for no real UX
 // gain; this keeps writes cheap while still feeling live to a polling client.
 export const RESTORE_PROGRESS_PERSIST_INTERVAL_MS = 700;
+export const BACKUP_PROGRESS_PERSIST_INTERVAL_MS = 700;
 
 // How often the scheduler tick task wakes up to check whether any destination's
 // schedule is due. 15 minutes gives ±15min precision on the chosen time, which is

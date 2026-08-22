@@ -55,8 +55,16 @@ export const createBackupEncryptionError = createErrorFactory({
   statusCode: 500,
 });
 
+export const createBackupLocalScheduleNotSupportedError = createErrorFactory({
+  message:
+    'Local folder backups can\'t be scheduled — they save straight to your browser, which needs to be open to receive the file. Use "Run backup now" instead, or switch this destination to WebDAV/FTP/Google Drive for unattended runs.',
+  code: 'backups.local_schedule_not_supported',
+  statusCode: 400,
+});
+
 export const createBackupUnknownDriverError = createErrorFactory({
   message: 'Unknown backup destination driver',
   code: 'backups.unknown_driver',
   statusCode: 400,
 });
+

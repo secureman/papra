@@ -30,7 +30,13 @@ export type PublicBackupDestination = Omit<
   driver: BackupDriverName;
 };
 
-export type BackupRunStatus = 'pending' | 'uploading' | 'succeeded' | 'failed';
+export type BackupRunStatus =
+  | 'pending'
+  | 'packaging'
+  | 'uploading'
+  | 'ready_for_download' // local-folder destinations only, see local driver
+  | 'succeeded'
+  | 'failed';
 export type BackupRunTrigger = 'manual' | 'scheduled';
 
 export type BackupSchedule = {

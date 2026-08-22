@@ -21,6 +21,7 @@ import {
   deleteDestinationUsecase,
   deleteRunUsecase,
   downloadBackupCopyUsecase,
+  downloadReadyBackupRunUsecase,
   getActiveRestoreJobUsecase,
   getRestoreJobUsecase,
   listDestinationsUsecase,
@@ -64,6 +65,7 @@ export function registerBackupsRoutes(context: RouteDefinitionContext) {
   setupRestoreFromRemoteFileRoute(context);
   setupRestoreFromUploadedFileRoute(context);
   setupDownloadBackupCopyRoute(context);
+  setupDownloadReadyRunRoute(context);
   setupVerifyRunRoute(context);
   setupGetActiveRestoreJobRoute(context);
   setupGetRestoreJobRoute(context);
@@ -559,6 +561,48 @@ function setupDownloadBackupCopyRoute({
         documentsStorageService,
         organizationId,
         db,
+      });
+
+      return context.body(new Uint8Array(envelope), 200, {
+        'Content-Type': 'application/octet-stream',
+        'Content-Disposition': `attachment; filename*=UTF-8''${encodeURIComponent(fileName)}`,
+        'Content-Length': String(envelope.length),
+        'X-Content-Type-Options': 'nosniff',
+        'X-Frame-Options': 'DENY',
+      });
+    },
+  );
+}
+
+// Claim the envelope of a 'local' destination run once it's ready_for_download
+// (see backups.local-delivery.service + runBackupPipeline). One-shot: a
+// second request after this succeeds gets a 404, same as if it expired.
+function setupDownloadReadyRunRoute({ app, config, db }: RouteDefinitionContext) {
+  app.get(
+    '/api/organizations/:organizationId/backups/destinations/:destinationId/runs/:runId/download',
+    requireAuthentication(),
+    validateParams(
+      v.strictObject({
+        organizationId: organizationIdSchema,
+        destinationId: backupDestinationIdSchema,
+        runId: backupRunIdSchema,
+      }),
+    ),
+    async (context) => {
+      const { userId } = getUser({ context });
+      const { organizationId, runId } = context.req.valid('param');
+
+      const organizationsRepository = createOrganizationsRepository({ db });
+      await ensureUserIsInOrganization({ userId, organizationId, organizationsRepository });
+
+      const services = createBackupsServices({ config });
+      const repository = createBackupsRepository({ db });
+
+      const { envelope, fileName } = await downloadReadyBackupRunUsecase({
+        services,
+        repository,
+        organizationId,
+        runId,
       });
 
       return context.body(new Uint8Array(envelope), 200, {

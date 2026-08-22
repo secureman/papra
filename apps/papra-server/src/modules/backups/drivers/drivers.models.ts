@@ -54,6 +54,13 @@ export type BackupDriver = {
     fileName: string;
     mimeType: string;
     content: Buffer;
+    // Optional: drivers that can report byte-level progress while sending
+    // (FTP via basic-ftp's trackProgress, chunked/streamed HTTP PUTs) should
+    // call this periodically with bytes sent so far. `content.length` is
+    // always the total, so callers don't need a separate total here. Drivers
+    // that only support a single all-at-once request can ignore this — the
+    // upload still works, it just jumps straight from 0% to 100%.
+    onProgress?: (args: { uploadedBytes: number }) => void;
   }) => Promise<{ remoteFileId: string; remoteFileName: string }>;
 
   downloadFile: (args: {

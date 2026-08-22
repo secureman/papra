@@ -4,6 +4,7 @@ import { createLogger } from '../shared/logger/logger';
 import { createBackupEncryptionService } from './backups.encryption.service';
 import { createBackupsNotConfiguredError, createBackupUnknownDriverError } from './backups.errors';
 import { createBackupPackagerService } from './backups.packager.service';
+import { createLocalDeliveryService } from './backups.local-delivery.service';
 import type { BackupDriverName } from './drivers/drivers.registry';
 import { backupDriverFactories } from './drivers/drivers.registry';
 
@@ -17,6 +18,7 @@ export function createBackupsServices({ config }: { config: Config }) {
   // guard with assertBackupsConfigured first for a clean 503 instead of a 500.
   const encryption = config.backups.kek ? createBackupEncryptionService({ config }) : undefined;
   const packager = createBackupPackagerService();
+  const localDelivery = createLocalDeliveryService();
 
   function getDriver(driverName: string): BackupDriver {
     const factory = backupDriverFactories[driverName as BackupDriverName];
@@ -29,6 +31,7 @@ export function createBackupsServices({ config }: { config: Config }) {
   return {
     encryption,
     packager,
+    localDelivery,
     getDriver,
     requireEncryption() {
       if (!encryption) {

@@ -1,5 +1,6 @@
 import { Buffer } from 'node:buffer';
 import { createLogger } from '../../../shared/logger/logger';
+import { BACKUP_FILE_EXTENSION } from '../../backups.constants';
 import { createBackupDriverApiError } from '../../backups.errors';
 import { defineBackupDriver } from '../drivers.models';
 import type { WebdavPreset } from './webdav.presets';
@@ -33,8 +34,24 @@ function getAuthHeader({ username, password }: { username: string; password: str
   return `Basic ${Buffer.from(`${username}:${password}`).toString('base64')}`;
 }
 
+// Path segments (folder names, file names) can contain spaces or other
+// characters that aren't valid raw in a URL — the default folder name is
+// literally "Papra Backups", a space right there. Every WebDAV call used to
+// build the URL by string-concatenating the raw path onto the root, which
+// worked by accident on some servers (loose URL parsers) and broke outright
+// on others (a strict `fetch()`/`URL` implementation either throws on the
+// space or leaves it un-encoded on the wire, and most WebDAV servers reject
+// or 404 on that). Encode each segment individually so `/` stays a
+// separator but everything inside a segment gets escaped.
+function encodePathSegments(path: string): string {
+  return path
+    .split('/')
+    .map((segment) => encodeURIComponent(segment))
+    .join('/');
+}
+
 function joinUrl(root: string, path: string): string {
-  return `${root.replace(/\/+$/, '')}/${path.replace(/^\/+/, '')}`;
+  return `${root.replace(/\/+$/, '')}/${encodePathSegments(path.replace(/^\/+/, ''))}`;
 }
 
 // Minimal PROPFIND response parser. We only need the href + displayname of each
@@ -52,13 +69,17 @@ export const webdavBackupDriverFactory = defineBackupDriver(() => {
     method,
     body,
     headers,
+    streamDuplex,
   }: {
     settings: WebdavSettings;
     credentials: { username?: string; password?: string };
     path: string;
     method: string;
-    body?: Buffer | string;
+    body?: Buffer | string | ReadableStream<Uint8Array>;
     headers?: Record<string, string>;
+    // Set when `body` is a ReadableStream — Node's fetch (undici) requires
+    // `duplex: 'half'` to be explicitly set for streamed request bodies.
+    streamDuplex?: boolean;
   }): Promise<Response> {
     const { username, password } = credentials;
     if (!username || !password) {
@@ -70,7 +91,8 @@ export const webdavBackupDriverFactory = defineBackupDriver(() => {
     const response = await fetch(url, {
       method,
       headers: { Authorization: getAuthHeader({ username, password }), ...(headers ?? {}) },
-      body,
+      body: body as RequestInit['body'],
+      ...(streamDuplex ? { duplex: 'half' as const } : {}),
     });
 
     if (!response.ok && response.status !== 207 /* Multi-Status, used by PROPFIND */) {
@@ -100,29 +122,72 @@ export const webdavBackupDriverFactory = defineBackupDriver(() => {
     async ensureRemoteFolder({ credentials, settings }) {
       const s = settings as unknown as WebdavSettings;
       const folderPath = s.remotePath ?? 'Papra Backups';
-      // MKCOL is idempotent-ish for our purposes: if it already exists we get a
-      // 405, which we treat as success. Any other failure is real.
       const root = getRootUrl({ settings: s, credentials });
-      const url = joinUrl(root, folderPath);
-      const response = await fetch(url, {
-        method: 'MKCOL',
-        headers: {
-          Authorization: getAuthHeader({
-            username: credentials.username!,
-            password: credentials.password!,
-          }),
-        },
+      const authHeader = getAuthHeader({
+        username: credentials.username!,
+        password: credentials.password!,
       });
-      if (!response.ok && response.status !== 405) {
-        throw createBackupDriverApiError();
+
+      // MKCOL only creates one collection level — a nested remotePath like
+      // "Documents/Papra Backups" needs "Documents" to already exist, or the
+      // server replies 409 Conflict (not the "already exists" 405 we used to
+      // treat as success). Walk the path segment by segment, creating each
+      // ancestor before the next: by the time we reach the last segment its
+      // parent is guaranteed to exist, so a 409/405 there really does just
+      // mean "this one's already there".
+      const segments = folderPath.split('/').filter(Boolean);
+      let builtPath = '';
+      for (const segment of segments) {
+        builtPath = builtPath ? `${builtPath}/${segment}` : segment;
+        const url = joinUrl(root, builtPath);
+        const response = await fetch(url, {
+          method: 'MKCOL',
+          headers: { Authorization: authHeader },
+        });
+        if (!response.ok && response.status !== 405 && response.status !== 409) {
+          const text = await response.text().catch(() => '');
+          logger.error({ url, status: response.status, text }, 'WebDAV MKCOL failed');
+          throw createBackupDriverApiError();
+        }
       }
       return { folderRef: folderPath };
     },
 
-    async uploadFile({ credentials, settings, folderRef, fileName, content }) {
+    async uploadFile({ credentials, settings, folderRef, fileName, content, onProgress }) {
       const s = settings as unknown as WebdavSettings;
       const path = `${folderRef}/${fileName}`;
-      await request({ settings: s, credentials, path, method: 'PUT', body: content });
+      // Stream the body in chunks (rather than one opaque Buffer) purely so
+      // we can call onProgress as each chunk is pulled — the server still
+      // receives the exact same bytes either way. Falls back to passing the
+      // Buffer directly when nobody's listening for progress, since Node's
+      // fetch requires `duplex: 'half'` for a streamed body and there's no
+      // reason to pay that complexity when it's not needed.
+      if (!onProgress) {
+        await request({ settings: s, credentials, path, method: 'PUT', body: content });
+        return { remoteFileId: path, remoteFileName: fileName };
+      }
+      const CHUNK_SIZE = 256 * 1024;
+      let offset = 0;
+      const body = new ReadableStream<Uint8Array>({
+        pull(controller) {
+          if (offset >= content.length) {
+            controller.close();
+            return;
+          }
+          const end = Math.min(offset + CHUNK_SIZE, content.length);
+          controller.enqueue(content.subarray(offset, end));
+          offset = end;
+          onProgress({ uploadedBytes: offset });
+        },
+      });
+      await request({
+        settings: s,
+        credentials,
+        path,
+        method: 'PUT',
+        body: body as unknown as Buffer,
+        streamDuplex: true,
+      });
       return { remoteFileId: path, remoteFileName: fileName };
     },
 
@@ -161,7 +226,8 @@ export const webdavBackupDriverFactory = defineBackupDriver(() => {
         files: hrefs
           .map((href) => new URL(href, root).pathname)
           .filter((p) => p.replace(/\/+$/, '') !== `${rootPath}/${folderRef}`.replace(/\/+$/, ''))
-          .filter((p) => !p.endsWith('/'))
+          .filter((p) => !p.endsWith('/')) // directories/collections
+          .filter((p) => p.endsWith(BACKUP_FILE_EXTENSION)) // ignore anything else parked in the folder
           .map((p) => ({
             remoteFileId: p.slice(rootPath.length).replace(/^\/+/, ''),
             name: decodeURIComponent(p.split('/').pop() ?? p),

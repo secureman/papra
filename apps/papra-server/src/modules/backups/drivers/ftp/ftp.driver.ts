@@ -11,7 +11,15 @@ export const FTP_DRIVER_NAME = 'ftp';
 type FtpSettings = {
   host: string;
   port?: number;
-  secure?: boolean; // FTPS (explicit TLS). Plain FTP is a bad idea over the public internet.
+  // FTPS (explicit TLS). Defaults to *off*: this is a self-hosted backup
+  // target, and the overwhelming majority of self-hosted/home FTP servers
+  // (a Synology/QNAP NAS, a Pi, a router's USB share) run plain FTP with no
+  // TLS cert configured at all. The previous default of `true` meant every
+  // one of those connections attempted an FTPS handshake the server didn't
+  // support and failed outright — "FTP isn't working" was this, not a real
+  // connectivity problem. Anyone who *does* have FTPS set up can still turn
+  // it on explicitly.
+  secure?: boolean;
   remotePath?: string;
 };
 
@@ -59,7 +67,7 @@ async function withClient<T>({
       port,
       user: username,
       password,
-      secure: settings.secure ?? true,
+      secure: settings.secure ?? false,
     });
     return await fn(client);
   } catch (error) {
@@ -94,14 +102,24 @@ export const ftpBackupDriverFactory = defineBackupDriver(() => {
       return { folderRef: folderPath };
     },
 
-    async uploadFile({ credentials, settings, folderRef, fileName, content }) {
+    async uploadFile({ credentials, settings, folderRef, fileName, content, onProgress }) {
       const s = settings as unknown as FtpSettings;
       await withClient({
         credentials,
         settings: s,
         fn: async (client) => {
           await client.ensureDir(folderRef);
-          await client.uploadFrom(Readable.from(content), fileName);
+          if (onProgress) {
+            // basic-ftp reports *total bytes transferred on the current
+            // operation*, not a delta — that's exactly the shape onProgress
+            // wants, so pass it straight through.
+            client.trackProgress((info) => onProgress({ uploadedBytes: info.bytes }));
+          }
+          try {
+            await client.uploadFrom(Readable.from(content), fileName);
+          } finally {
+            client.trackProgress(); // stop tracking so the handler isn't kept alive/reused across calls
+          }
         },
       });
       return { remoteFileId: `${folderRef}/${fileName}`, remoteFileName: fileName };
