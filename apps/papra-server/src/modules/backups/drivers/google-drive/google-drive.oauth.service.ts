@@ -62,10 +62,17 @@ export function createGoogleDriveOAuthService({ config }: { config: Config }) {
         signal: controller.signal,
       });
     } catch (error) {
-      logger.error({ error }, 'Failed to reach the Google OAuth token endpoint');
+      // undici wraps the real failure (DNS, timeout, connection reset...) in
+      // `error.cause` — surfacing it here and in the thrown message is the
+      // difference between "fetch failed" and an actionable diagnosis.
+      const cause = (error as TypeError & { cause?: { code?: string; message?: string } }).cause;
+      const causeSummary = cause ? `${cause.code ?? ''} ${cause.message ?? ''}`.trim() : '';
+      logger.error({ error, cause: causeSummary || undefined }, 'Failed to reach the Google OAuth token endpoint');
       throw createBackupDriverOAuthError({
         message:
-          "Could not reach the Google OAuth endpoint. Check the server's internet connection " +
+          'Could not reach the Google OAuth endpoint' +
+          (causeSummary ? ` (${causeSummary})` : '') +
+          ". Check the server's internet connection " +
           'and try again. If this persists, reconnect the destination from the web app.',
         cause: error,
       });
