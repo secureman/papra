@@ -40,10 +40,7 @@ export const googleDriveBackupDriverFactory = defineBackupDriver(({ config }) =>
     const accessToken = await getAccessToken({ refreshToken });
 
     const timeoutController = new AbortController();
-    const timeoutId = setTimeout(
-      () => timeoutController.abort(),
-      GOOGLE_DRIVE_REQUEST_TIMEOUT_MS,
-    );
+    const timeoutId = setTimeout(() => timeoutController.abort(), GOOGLE_DRIVE_REQUEST_TIMEOUT_MS);
 
     let response: Response;
     try {
@@ -205,7 +202,10 @@ export const googleDriveBackupDriverFactory = defineBackupDriver(({ config }) =>
         }
       } catch (error) {
         await reader.cancel().catch(() => {});
-        logger.error({ url, downloadedBytes, totalBytes }, 'Google Drive download stalled or failed');
+        logger.error(
+          { url, downloadedBytes, totalBytes },
+          'Google Drive download stalled or failed',
+        );
         throw error;
       }
 

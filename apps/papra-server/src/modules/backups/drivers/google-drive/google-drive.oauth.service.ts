@@ -65,7 +65,7 @@ export function createGoogleDriveOAuthService({ config }: { config: Config }) {
       logger.error({ error }, 'Failed to reach the Google OAuth token endpoint');
       throw createBackupDriverOAuthError({
         message:
-          'Could not reach the Google OAuth endpoint. Check the server\'s internet connection ' +
+          "Could not reach the Google OAuth endpoint. Check the server's internet connection " +
           'and try again. If this persists, reconnect the destination from the web app.',
         cause: error,
       });

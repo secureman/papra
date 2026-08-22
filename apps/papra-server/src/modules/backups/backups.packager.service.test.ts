@@ -35,7 +35,24 @@ describe('backups packager service', () => {
   });
 
   describe('pack validation', () => {
-    test('rejects entry names that exceed the ustar 100-character limit instead of silently truncating', async () => {
+    test('round-trips long paths through the ustar prefix field', async () => {
+      const service = createBackupPackagerService();
+      // 'files/' + a 94-char basename: total path >100 chars, so the header
+      // must carry 'files' in the prefix field and the basename in name.
+      const longPath = `files/${'b'.repeat(95)}`;
+      expect(longPath.length).toBeGreaterThan(100);
+
+      const archive = await service.pack({
+        manifest: {},
+        files: [{ name: longPath, content: Buffer.from('y') }],
+      });
+      const unpacked = await service.unpack({ archive });
+
+      expect([...unpacked.files.keys()]).toEqual([longPath]);
+      expect(unpacked.files.get(longPath)!.toString()).toBe('y');
+    });
+
+    test('rejects entries whose final segment exceeds the 100-byte name field instead of silently truncating', async () => {
       const service = createBackupPackagerService();
 
       await expect(
@@ -43,7 +60,18 @@ describe('backups packager service', () => {
           manifest: {},
           files: [{ name: `${'a'.repeat(150)}.txt`, content: Buffer.from('x') }],
         }),
-      ).rejects.toThrow(/exceeds 100 characters/);
+      ).rejects.toThrow(/cannot be stored in the archive format/);
+    });
+
+    test('rejects files/ entries with an over-long basename (no splittable boundary)', async () => {
+      const service = createBackupPackagerService();
+
+      await expect(
+        service.pack({
+          manifest: {},
+          files: [{ name: `files/${'c'.repeat(150)}`, content: Buffer.from('x') }],
+        }),
+      ).rejects.toThrow(/cannot be stored in the archive format/);
     });
 
     test('accepts names just under the limit', async () => {

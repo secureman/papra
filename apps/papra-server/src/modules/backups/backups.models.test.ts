@@ -1,5 +1,9 @@
 import { describe, expect, test } from 'vitest';
-import { computeNextScheduledAt, parseScheduleDays } from './backups.models';
+import {
+  buildBackupEntryFileName,
+  computeNextScheduledAt,
+  parseScheduleDays,
+} from './backups.models';
 import type { BackupSchedule } from './backups.types';
 
 function createSchedule(overrides: Partial<BackupSchedule> = {}): BackupSchedule {
@@ -13,6 +17,50 @@ function createSchedule(overrides: Partial<BackupSchedule> = {}): BackupSchedule
 }
 
 describe('backups models', () => {
+  describe('buildBackupEntryFileName', () => {
+    const documentId = 'doc_cn0m8f2h8aefhx8e66sjjh6e';
+
+    test('sanitizes unsafe characters and keeps short names intact', () => {
+      expect(buildBackupEntryFileName({ documentId, originalName: 'my invoice (2026).pdf' })).toBe(
+        `${documentId}-my_invoice__2026_.pdf`,
+      );
+    });
+
+    test('trims over-long names to the ustar limit while keeping the extension and id prefix', () => {
+      // The exact case from a real backup failure: a very long original file
+      // name collapses into underscores and blows past the tar name field.
+      const longName = `${'_'.repeat(22)}-${'_'.repeat(45)}.pdf`.replace('-', '_');
+      const fileName = buildBackupEntryFileName({
+        documentId,
+        originalName: `${'very-long-'.repeat(20)}.pdf`,
+      });
+
+      expect(fileName.length).toBeLessThanOrEqual(100);
+      expect(fileName.startsWith(`${documentId}-`)).toBe(true);
+      expect(fileName.endsWith('.pdf')).toBe(true);
+      expect(longName.length).toBeGreaterThan(0); // sanity
+    });
+
+    test('trims extension-less names too', () => {
+      const fileName = buildBackupEntryFileName({
+        documentId,
+        originalName: 'x'.repeat(200),
+      });
+
+      expect(fileName.length).toBeLessThanOrEqual(100);
+      expect(fileName.startsWith(`${documentId}-`)).toBe(true);
+    });
+
+    test('never exceeds the limit even with a pathological extension', () => {
+      const fileName = buildBackupEntryFileName({
+        documentId,
+        originalName: `a.${'.'.repeat(150)}`,
+      });
+
+      expect(fileName.length).toBeLessThanOrEqual(100);
+      expect(fileName.startsWith(documentId)).toBe(true);
+    });
+  });
   describe('computeNextScheduledAt', () => {
     test('returns null when the schedule is disabled', () => {
       expect(

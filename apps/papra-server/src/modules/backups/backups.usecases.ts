@@ -16,7 +16,11 @@ import { createLogger } from '../shared/logger/logger';
 import { generateId } from '../shared/random/ids';
 import { addTagToDocument as addTagToDocumentUsecase } from '../tags/tags.usecases';
 import { createTagsRepository } from '../tags/tags.repository';
-import { computeNextScheduledAt, parseScheduleDays } from './backups.models';
+import {
+  buildBackupEntryFileName,
+  computeNextScheduledAt,
+  parseScheduleDays,
+} from './backups.models';
 import {
   backupRestoreJobIdPrefix,
   BACKUP_FILE_EXTENSION,
@@ -446,7 +450,7 @@ async function buildEncryptedBackupEnvelope({
       }
       const content = Buffer.concat(chunks);
       files.push({
-        name: `${doc.id}-${doc.originalName.replace(/[^\w.-]/g, '_')}`,
+        name: buildBackupEntryFileName({ documentId: doc.id, originalName: doc.originalName }),
         content,
       });
       processedBytes += content.length;

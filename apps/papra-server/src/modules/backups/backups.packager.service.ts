@@ -23,9 +23,12 @@ import { isNil } from '../shared/utils';
 
 const BLOCK_SIZE = 512;
 const FILE_MODE_REGULAR = 0o644;
-// Classic ustar stores the whole path in a single 100-byte name field (we
-// don't implement the prefix split), and the size field is 12 octal digits.
-const MAX_ENTRY_NAME_LENGTH = 100;
+// Classic ustar splits long paths across two header fields: the final path
+// segment lives in `name` (100 bytes at offset 0) and everything before it in
+// `prefix` (155 bytes at offset 345). A path is representable when its last
+// segment fits in 100 bytes and some '/' boundary leaves a ≤155-byte prefix.
+const MAX_NAME_FIELD_LENGTH = 100;
+const MAX_PREFIX_FIELD_LENGTH = 155;
 const MAX_ENTRY_SIZE_BYTES = 8 * 1024 * 1024 * 1024 - 1;
 
 type TarEntry = { name: string; content: Buffer };
@@ -60,10 +63,42 @@ function checksum(header: Buffer): number {
   return sum;
 }
 
+// Split an entry path into ustar's name/prefix fields. Short paths fit the
+// name field alone; longer ones are split on a '/' boundary. Throws when the
+// path can't be represented at all (final segment >100 bytes, or no '/' in
+// range to keep the prefix ≤155 bytes).
+function splitUstarPath(name: string): { nameField: string; prefixField: string } {
+  if (Buffer.byteLength(name, 'utf8') <= MAX_NAME_FIELD_LENGTH) {
+    return { nameField: name, prefixField: '' };
+  }
+
+  // Try every '/' boundary from the end backwards and take the first one
+  // where both fields fit their limits — i.e. the shortest possible suffix,
+  // which maximizes headroom on the prefix side.
+  for (let index = name.length - 2; index >= 1; index -= 1) {
+    if (name[index] !== '/') {
+      continue;
+    }
+    const nameField = name.slice(index + 1);
+    const prefixField = name.slice(0, index);
+    if (
+      Buffer.byteLength(nameField, 'utf8') <= MAX_NAME_FIELD_LENGTH &&
+      Buffer.byteLength(prefixField, 'utf8') <= MAX_PREFIX_FIELD_LENGTH
+    ) {
+      return { nameField, prefixField };
+    }
+  }
+
+  throw new Error(
+    `Backup entry path cannot be stored in the archive format (final path segment must be ≤ ${MAX_NAME_FIELD_LENGTH} bytes and the leading directories ≤ ${MAX_PREFIX_FIELD_LENGTH} bytes)`,
+  );
+}
+
 function buildEntryHeader({ name, size }: { name: string; size: number }): Buffer {
+  const { nameField, prefixField } = splitUstarPath(name);
   const header = Buffer.alloc(BLOCK_SIZE);
   // name (100 bytes at offset 0)
-  writeString(header, 0, name, 100);
+  writeString(header, 0, nameField, MAX_NAME_FIELD_LENGTH);
   // mode (8 bytes at offset 100): "0000644\0"
   writeOctal(header, 100, FILE_MODE_REGULAR, 8);
   // uid (8 bytes at offset 108): "0000000\0"
@@ -81,6 +116,9 @@ function buildEntryHeader({ name, size }: { name: string; size: number }): Buffe
   writeString(header, 257, 'ustar', 6);
   // ustar version at offset 263: "00"
   writeString(header, 263, '00', 2);
+  // prefix (155 bytes at offset 345): leading directories for long paths.
+  // Written before the checksum is computed over the whole block.
+  writeString(header, 345, prefixField, MAX_PREFIX_FIELD_LENGTH);
 
   const sum = checksum(header);
   // Checksum field is 6 octal digits + NUL + space, per ustar spec.
@@ -93,13 +131,14 @@ function buildEntryHeader({ name, size }: { name: string; size: number }): Buffe
 // Pack an array of entries into a single Buffer (the tarball bytes).
 function packTar(entries: TarEntry[]): Buffer {
   for (const entry of entries) {
-    // Fail loudly rather than silently truncating: a truncated name could
-    // collide with another entry's name or break the id-prefix matching the
+    // Validate up front with a clear message rather than letting a malformed
+    // header slip through: names that don't fit would previously be silently
+    // truncated, which could collide or break the id-prefix matching that the
     // restore and verify flows rely on.
-    if (Buffer.byteLength(entry.name, 'utf8') > MAX_ENTRY_NAME_LENGTH) {
-      throw new Error(
-        `Backup entry name exceeds ${MAX_ENTRY_NAME_LENGTH} characters and cannot be stored in the archive: "${entry.name}"`,
-      );
+    try {
+      splitUstarPath(entry.name);
+    } catch (error) {
+      throw new Error(`${(error as Error).message} [entry: "${entry.name}"]`);
     }
     if (entry.content.length > MAX_ENTRY_SIZE_BYTES) {
       throw new Error(
@@ -149,7 +188,10 @@ function unpackTar(buffer: Buffer): TarEntry[] {
     if (header.every((b) => b === 0)) {
       break; // end-of-archive
     }
-    const name = readString(header, 0, 100);
+    const nameField = readString(header, 0, MAX_NAME_FIELD_LENGTH);
+    const prefixField = readString(header, 345, MAX_PREFIX_FIELD_LENGTH);
+    // ustar long paths: the leading directories ride in the prefix field.
+    const name = prefixField ? `${prefixField}/${nameField}` : nameField;
     const size = readOctal(header, 124, 12);
     offset += BLOCK_SIZE;
     const content = Buffer.from(buffer.subarray(offset, offset + size));
