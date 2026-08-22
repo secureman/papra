@@ -35,7 +35,7 @@ export async function registerBackupRetentionCleanupTask(deps: GlobalDependencie
     return;
   }
 
-  await taskServices.registerTask({
+  taskServices.registerTask({
     taskName: TASK_NAME,
     handler: async () => {
       const services = createBackupsServices({ config });

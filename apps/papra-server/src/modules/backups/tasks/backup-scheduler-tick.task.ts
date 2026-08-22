@@ -20,7 +20,7 @@ export async function registerBackupSchedulerTickTask(deps: GlobalDependencies) 
     return;
   }
 
-  await taskServices.registerTask({
+  taskServices.registerTask({
     taskName: TASK_NAME,
     handler: async () => {
       const services = createBackupsServices({ config });

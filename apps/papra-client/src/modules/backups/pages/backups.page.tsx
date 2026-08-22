@@ -745,7 +745,7 @@ const DestinationCard: Component<{
 
     // Start polling to update status until backup completes
     const interval = setInterval(() => {
-      refetchRuns().then(() => {
+      void refetchRuns().then(() => {
         // Stop polling when there are no more pending or uploading runs
         if (!hasPendingOrUploadingRuns()) {
           clearInterval(interval);
@@ -913,7 +913,7 @@ const DestinationCard: Component<{
               checked={isScheduleEnabled()}
               onChange={(checked) => {
                 setIsScheduleEnabled(checked);
-                saveSchedule({ isEnabled: checked });
+                void saveSchedule({ isEnabled: checked });
               }}
             >
               <SwitchControl>
@@ -932,7 +932,7 @@ const DestinationCard: Component<{
                     class={`text-xs px-2 py-1 rounded border ${days().has(index()) ? 'bg-primary text-primary-foreground border-primary' : 'border-border'}`}
                     onClick={() => {
                       toggleDay(index());
-                      saveSchedule();
+                      void saveSchedule();
                     }}
                   >
                     {label}
@@ -944,7 +944,7 @@ const DestinationCard: Component<{
                 value={String(hour())}
                 onChange={(v) => {
                   setHour(Math.min(23, Math.max(0, Number(v) || 0)));
-                  saveSchedule();
+                  void saveSchedule();
                 }}
               >
                 <TextField type="number" min={0} max={23} />
@@ -955,7 +955,7 @@ const DestinationCard: Component<{
                 value={String(minute()).padStart(2, '0')}
                 onChange={(v) => {
                   setMinute(Math.min(59, Math.max(0, Number(v) || 0)));
-                  saveSchedule();
+                  void saveSchedule();
                 }}
               >
                 <TextField type="number" min={0} max={59} />

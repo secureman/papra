@@ -103,7 +103,7 @@ function readOctal(buffer: Buffer, offset: number, length: number): number {
   const raw = buffer
     .subarray(offset, offset + length)
     .toString('utf8')
-    .replace(/\0+$/g, '')
+    .replace(/\u0000+$/g, '')
     .trimEnd();
   if (raw.length === 0) {
     return 0;
@@ -116,7 +116,7 @@ function readString(buffer: Buffer, offset: number, length: number): string {
   return buffer
     .subarray(offset, offset + length)
     .toString('utf8')
-    .replace(/\0+$/g, '')
+    .replace(/\u0000+$/g, '')
     .trimEnd();
 }
 

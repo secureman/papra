@@ -47,9 +47,11 @@ export const googleDriveBackupDriverFactory = defineBackupDriver(({ config }) =>
 
     let response: Response;
     try {
+      const headers = new Headers(init.headers);
+      headers.set('Authorization', `Bearer ${accessToken}`);
       response = await fetch(url, {
         ...init,
-        headers: { ...(init.headers ?? {}), Authorization: `Bearer ${accessToken}` },
+        headers,
         signal: timeoutController.signal,
       });
     } catch (error) {
