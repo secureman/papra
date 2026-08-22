@@ -39,14 +39,20 @@ export const RestoreProgressIndicator: Component = () => {
             class="relative"
             aria-label="Restore in progress"
           >
-            <div class="i-tabler-settings size-4 animate-spin" style={{ 'animation-duration': '2.5s' }} />
+            <div
+              class="i-tabler-settings size-4 animate-spin"
+              style={{ 'animation-duration': '2.5s' }}
+            />
             <span class="absolute -top-1 -right-1 size-2 rounded-full bg-primary" />
           </PopoverTrigger>
 
           <PopoverContent class="w-80">
             <div class="flex flex-col gap-3">
               <div class="flex items-center gap-2">
-                <div class="i-tabler-settings size-4 animate-spin text-primary" style={{ 'animation-duration': '2.5s' }} />
+                <div
+                  class="i-tabler-settings size-4 animate-spin text-primary"
+                  style={{ 'animation-duration': '2.5s' }}
+                />
                 <span class="text-sm font-medium">{STATUS_LABELS[job().status]}</span>
               </div>
 

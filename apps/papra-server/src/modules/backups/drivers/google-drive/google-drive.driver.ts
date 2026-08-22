@@ -120,7 +120,7 @@ export const googleDriveBackupDriverFactory = defineBackupDriver(({ config }) =>
 
     // Resumable upload: start a session, then PUT the bytes. Handles backups
     // larger than the 5MB multipart-upload ceiling.
-    async uploadFile({ credentials, folderRef, fileName, mimeType, content }) {
+    async uploadFile({ credentials, folderRef, fileName, mimeType, content, onProgress }) {
       const refreshToken = credentials.refreshToken!;
 
       const sessionInitResponse = await authorizedFetch({
@@ -138,14 +138,44 @@ export const googleDriveBackupDriverFactory = defineBackupDriver(({ config }) =>
       }
 
       const accessToken = await getAccessToken({ refreshToken });
-      const uploadResponse = await fetch(sessionUri, {
+
+      // Stream the body in chunks (rather than one opaque Buffer) so
+      // onProgress fires as undici pulls each slice — same trick as the
+      // WebDAV driver. Node's fetch (undici) requires `duplex: 'half'` for a
+      // streamed request body; when nobody listens for progress we pass the
+      // Buffer directly and skip that complexity.
+      let uploadInit: RequestInit = {
         method: 'PUT',
         headers: {
           'Content-Type': mimeType || GOOGLE_DRIVE_BACKUP_FILE_MIME_TYPE,
           'Authorization': `Bearer ${accessToken}`,
         },
         body: content,
-      });
+      };
+      if (onProgress) {
+        const CHUNK_SIZE = 256 * 1024;
+        let offset = 0;
+        const bodyStream = new ReadableStream<Uint8Array>({
+          pull(controller) {
+            if (offset >= content.length) {
+              controller.close();
+              return;
+            }
+            const end = Math.min(offset + CHUNK_SIZE, content.length);
+            controller.enqueue(content.subarray(offset, end));
+            offset = end;
+            onProgress({ uploadedBytes: offset });
+          },
+        });
+        uploadInit = {
+          ...uploadInit,
+          body: bodyStream,
+          // `duplex` isn't in the standard RequestInit typings.
+          duplex: 'half',
+        } as RequestInit;
+      }
+
+      const uploadResponse = await fetch(sessionUri, uploadInit);
       if (!uploadResponse.ok) {
         const body = await uploadResponse.text();
         logger.error({ status: uploadResponse.status, body }, 'Google Drive upload failed');

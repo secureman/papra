@@ -90,6 +90,14 @@ function formatBytes(bytes: number | null): string {
   return `${value.toFixed(1)} ${units[unitIndex]}`;
 }
 
+// Same shape as the restore indicator's ETA labels — rough and honest about it.
+function formatEtaLabel(remainingMs: number): string {
+  if (remainingMs < 5000) return 'almost done';
+  if (remainingMs < 60_000) return `~${Math.ceil(remainingMs / 1000)}s left`;
+  if (remainingMs < 60 * 60_000) return `~${Math.ceil(remainingMs / 60_000)}m left`;
+  return `~${Math.ceil(remainingMs / (60 * 60_000))}h left`;
+}
+
 const STATUS_VARIANT: Record<BackupRun['status'], 'default' | 'secondary' | 'destructive'> = {
   pending: 'secondary',
   packaging: 'secondary',
@@ -112,7 +120,10 @@ const STATUS_LABEL: Record<BackupRun['status'], string> = {
 // documents) and uploading (sending the finished envelope to the driver) are
 // two separate phases with their own totals, so each gets its own bar rather
 // than faking a single 0-100 number across both.
-function describeRunProgress(run: BackupRun): { label: string; percent: number | null } {
+function describeRunProgress(
+  run: BackupRun,
+  uploadRate?: { bytesPerSecond: number },
+): { label: string; percent: number | null } {
   if (run.status === 'packaging') {
     const total = run.totalRawBytes;
     const processed = run.processedBytes ?? 0;
@@ -135,7 +146,12 @@ function describeRunProgress(run: BackupRun): { label: string; percent: number |
       return { label: 'Uploading…', percent: null };
     }
     const percent = Math.min(100, Math.round((uploaded / total) * 100));
-    return { label: `Uploading… ${formatBytes(uploaded)} / ${formatBytes(total)}`, percent };
+    let label = `Uploading… ${formatBytes(uploaded)} / ${formatBytes(total)}`;
+    if (uploadRate && uploadRate.bytesPerSecond > 0 && total - uploaded > 0) {
+      const remainingMs = ((total - uploaded) / uploadRate.bytesPerSecond) * 1000;
+      label += ` · ${formatEtaLabel(remainingMs)}`;
+    }
+    return { label, percent };
   }
   return { label: STATUS_LABEL[run.status], percent: null };
 }
@@ -780,6 +796,39 @@ const DestinationCard: Component<{
     props.destination.schedule.isEnabled,
   );
 
+  // Rolling upload-throughput estimate per run, fed by the run polls — lets
+  // the uploading row show a rough "~Xm left" without extra server-side
+  // timestamps. Smoothed so one jittery poll doesn't swing the estimate.
+  const uploadRateSamples = new Map<
+    string,
+    { bytes: number; at: number; bytesPerSecond?: number }
+  >();
+
+  const getUploadRate = (run: BackupRun): { bytesPerSecond: number } | undefined => {
+    if (run.status !== 'uploading' || !run.uploadedBytes) {
+      uploadRateSamples.delete(run.id);
+      return undefined;
+    }
+    const now = Date.now();
+    const sample = uploadRateSamples.get(run.id);
+    if (!sample || run.uploadedBytes < sample.bytes) {
+      // New run, or progress went backwards (shouldn't happen anymore) — reset.
+      uploadRateSamples.set(run.id, { bytes: run.uploadedBytes, at: now });
+      return undefined;
+    }
+    const elapsedSeconds = (now - sample.at) / 1000;
+    const deltaBytes = run.uploadedBytes - sample.bytes;
+    if (elapsedSeconds < 1 || deltaBytes <= 0) {
+      return sample.bytesPerSecond ? { bytesPerSecond: sample.bytesPerSecond } : undefined;
+    }
+    const instantBytesPerSecond = deltaBytes / elapsedSeconds;
+    const bytesPerSecond = sample.bytesPerSecond
+      ? 0.6 * sample.bytesPerSecond + 0.4 * instantBytesPerSecond
+      : instantBytesPerSecond;
+    uploadRateSamples.set(run.id, { bytes: run.uploadedBytes, at: now, bytesPerSecond });
+    return { bytesPerSecond };
+  };
+
   const toggleDay = (day: number) => {
     const next = new Set(days());
     if (next.has(day)) next.delete(day);
@@ -1090,7 +1139,7 @@ const DestinationCard: Component<{
                     <Badge variant={STATUS_VARIANT[run.status]}>{STATUS_LABEL[run.status]}</Badge>
                     <Show when={run.status === 'packaging' || run.status === 'uploading'}>
                       {(() => {
-                        const progress = describeRunProgress(run);
+                        const progress = describeRunProgress(run, getUploadRate(run));
                         return (
                           <div class="mt-1 max-w-48">
                             <Show

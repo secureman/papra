@@ -20,7 +20,13 @@ export type BackupDestination = {
   createdAt: Date;
 };
 
-export type BackupRunStatus = 'pending' | 'packaging' | 'uploading' | 'ready_for_download' | 'succeeded' | 'failed';
+export type BackupRunStatus =
+  | 'pending'
+  | 'packaging'
+  | 'uploading'
+  | 'ready_for_download'
+  | 'succeeded'
+  | 'failed';
 
 export type BackupRun = {
   id: string;
