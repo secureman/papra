@@ -12,11 +12,7 @@ import type {
 import { injectArguments } from '@corentinth/chisels';
 import { and, desc, eq, inArray, isNotNull, lte } from 'drizzle-orm';
 import { omitUndefined } from '../shared/objects';
-import {
-  backupDestinationsTable,
-  backupRestoreJobsTable,
-  backupRunsTable,
-} from './backups.table';
+import { backupDestinationsTable, backupRestoreJobsTable, backupRunsTable } from './backups.table';
 
 export type BackupsRepository = ReturnType<typeof createBackupsRepository>;
 
@@ -190,11 +186,7 @@ async function createRun({
   // (destination_id) WHERE status IN ('pending','uploading') makes a second
   // simultaneous insert a no-op. Returns undefined when the destination
   // already has an in-progress run.
-  const [inserted] = await db
-    .insert(backupRunsTable)
-    .values(run)
-    .onConflictDoNothing()
-    .returning();
+  const [inserted] = await db.insert(backupRunsTable).values(run).onConflictDoNothing().returning();
   return { run: inserted };
 }
 
@@ -260,7 +252,9 @@ async function updateRunStatus({
 }): Promise<void> {
   await db
     .update(backupRunsTable)
-    .set({ status, ...omitUndefined(fields) })
+    // updatedAt is bumped on every write so it doubles as a heartbeat: the
+    // stale-run cleanup judges liveness by last write, not creation time.
+    .set({ status, ...omitUndefined(fields), updatedAt: new Date() })
     .where(eq(backupRunsTable.id, runId));
 }
 
@@ -277,7 +271,11 @@ async function updateRunProgress({
   fields: Partial<Pick<BackupRun, 'processedDocumentsCount' | 'processedBytes' | 'uploadedBytes'>>;
   db: Database;
 }): Promise<void> {
-  await db.update(backupRunsTable).set(omitUndefined(fields)).where(eq(backupRunsTable.id, runId));
+  // updatedAt bump = heartbeat, same as updateRunStatus above.
+  await db
+    .update(backupRunsTable)
+    .set({ ...omitUndefined(fields), updatedAt: new Date() })
+    .where(eq(backupRunsTable.id, runId));
 }
 
 async function deleteRun({
@@ -294,17 +292,21 @@ async function deleteRun({
   return { deleted: result.length > 0 };
 }
 
-// Marks runs stuck in pending/uploading past the stale threshold as failed.
-// Fixes a real bug carried over from an earlier draft of this feature: the
-// previous version filtered by organization only, with no status or age check,
-// which would have marked every historical run as failed on every backup.
+// Marks runs stuck in an in-progress status past the stale threshold as failed.
+// Liveness is judged by updatedAt (last write), not createdAt: a run whose
+// pipeline is still writing progress is never reaped, while a row orphaned by
+// a dead process (no more writes) ages out normally. The caller picks which
+// in-progress statuses to reap — 'pending'/'packaging'/'uploading' use the 24h
+// threshold, 'ready_for_download' a short one (see backups.constants).
 async function markStaleInProgressRunsAsFailed({
   destinationId,
+  statuses,
   staleBefore,
   errorMessage,
   db,
 }: {
   destinationId: string;
+  statuses: BackupRunStatus[];
   staleBefore: Date;
   errorMessage: string;
   db: Database;
@@ -315,8 +317,8 @@ async function markStaleInProgressRunsAsFailed({
     .where(
       and(
         eq(backupRunsTable.destinationId, destinationId),
-        inArray(backupRunsTable.status, ['pending', 'uploading']),
-        lte(backupRunsTable.createdAt, staleBefore),
+        inArray(backupRunsTable.status, statuses),
+        lte(backupRunsTable.updatedAt, staleBefore),
       ),
     )
     .returning({ id: backupRunsTable.id });
@@ -435,7 +437,10 @@ async function markStaleInProgressRestoreJobsAsFailed({
       and(
         eq(backupRestoreJobsTable.organizationId, organizationId),
         inArray(backupRestoreJobsTable.status, ['pending', 'downloading', 'restoring']),
-        lte(backupRestoreJobsTable.createdAt, staleBefore),
+        // Judge liveness by updatedAt (bumped on every progress write), not
+        // createdAt — a legitimately long restore that's still reporting
+        // progress must never be reaped by a newer job starting up.
+        lte(backupRestoreJobsTable.updatedAt, staleBefore),
       ),
     )
     .returning({ id: backupRestoreJobsTable.id });

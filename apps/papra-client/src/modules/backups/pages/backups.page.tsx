@@ -3,7 +3,16 @@ import type { BackupDestination, BackupDriverName, BackupRun } from '../backups.
 import { safely } from '@corentinth/chisels';
 import { useParams, useSearchParams } from '@solidjs/router';
 import { useQuery, useQueryClient } from '@tanstack/solid-query';
-import { createMemo, createEffect, createSignal, For, on, Show, onCleanup } from 'solid-js';
+import {
+  createMemo,
+  createEffect,
+  createSignal,
+  For,
+  on,
+  Show,
+  onCleanup,
+  onMount,
+} from 'solid-js';
 import { useI18nApiErrors } from '@/modules/shared/http/composables/i18n-api-errors';
 import { useConfirmModal } from '@/modules/shared/confirm';
 import { downloadFile, saveBlobToDisk } from '@/modules/shared/files/download';
@@ -108,7 +117,10 @@ function describeRunProgress(run: BackupRun): { label: string; percent: number |
     const total = run.totalRawBytes;
     const processed = run.processedBytes ?? 0;
     if (!total) {
-      return { label: `Reading documents… ${run.processedDocumentsCount}/${run.documentsCount ?? '?'}`, percent: null };
+      return {
+        label: `Reading documents… ${run.processedDocumentsCount}/${run.documentsCount ?? '?'}`,
+        percent: null,
+      };
     }
     const percent = Math.min(100, Math.round((processed / total) * 100));
     return {
@@ -152,7 +164,34 @@ export const BackupsSettingsPage: Component = () => {
       queryKey: ['organizations', organizationId(), 'backups', 'destinations'],
     });
 
-  const [isAddDialogOpen, setIsAddDialogOpen] = createSignal(Boolean(searchParams.connected));
+  const [isAddDialogOpen, setIsAddDialogOpen] = createSignal(false);
+
+  // Google Drive OAuth lands back here with ?backupConnected=1 or
+  // ?backupError=<code> — surface it as a toast, then strip the params from the
+  // URL so a refresh doesn't replay the message. (The destination itself was
+  // already created server-side during the callback.)
+  onMount(() => {
+    const { backupConnected, backupError } = searchParams;
+    if (!backupConnected && !backupError) {
+      return;
+    }
+    if (backupConnected) {
+      createToast({ type: 'success', message: 'Google Drive destination added' });
+    } else {
+      const errorMessages: Record<string, string> = {
+        google_drive_oauth_denied: 'Google Drive connection was cancelled or denied.',
+        google_drive_oauth_expired: 'The Google Drive connection attempt expired — try again.',
+        google_drive_no_refresh_token:
+          'Google did not issue a refresh token — reconnect the destination.',
+        google_drive_oauth_failed: 'Could not complete the Google Drive connection — try again.',
+      };
+      createToast({
+        type: 'error',
+        message: errorMessages[backupError as string] ?? 'Google Drive connection failed.',
+      });
+    }
+    window.history.replaceState(null, '', window.location.pathname);
+  });
 
   return (
     <div class="p-6 max-w-4xl mx-auto flex flex-col gap-6">
@@ -272,7 +311,10 @@ const RecoverFromFileDialog: Component<{ organizationId: string }> = (props) => 
       return;
     }
     registerRestoreJob({ organizationId: props.organizationId, jobId: result.jobId });
-    createToast({ type: 'success', message: 'Restore started — see the progress indicator in the header' });
+    createToast({
+      type: 'success',
+      message: 'Restore started — see the progress indicator in the header',
+    });
     setIsOpen(false);
     setFile(null);
   };
@@ -327,7 +369,6 @@ const AddDestinationDialog: Component<{
   const [isFtpsEnabled, setIsFtpsEnabled] = createSignal(false);
   const [username, setUsername] = createSignal('');
   const [password, setPassword] = createSignal('');
-  const [localPath, setLocalPath] = createSignal('');
   const [isTesting, setIsTesting] = createSignal(false);
   const [isSubmitting, setIsSubmitting] = createSignal(false);
 
@@ -353,7 +394,7 @@ const AddDestinationDialog: Component<{
       };
     }
     if (isLocal()) {
-      return { credentials: {}, settings: { path: localPath() } };
+      return { credentials: {}, settings: {} };
     }
     return { credentials: {}, settings: {} };
   };
@@ -540,14 +581,11 @@ const AddDestinationDialog: Component<{
           </Show>
 
           <Show when={isLocal()}>
-            <TextFieldRoot value={localPath()} onChange={setLocalPath}>
-              <TextFieldLabel>Folder path</TextFieldLabel>
-              <TextField placeholder="/storage/emulated/0/papra-backups" />
-            </TextFieldRoot>
-            <p class="text-xs text-muted-foreground -mt-2">
-              A path on the server's own filesystem — created automatically if it doesn't exist.
-              Useful for backing up to a second mount (e.g. an SD card) or a folder something else
-              already syncs (Syncthing, rclone, etc). No credentials needed.
+            <p class="text-xs text-muted-foreground">
+              Local backups are delivered straight to this browser — when you hit "Run backup now",
+              your browser will prompt you to choose where to save the file. Nothing is written to
+              the server's filesystem, and it can't run on a schedule (the page needs to be open to
+              receive the file). No credentials needed.
             </p>
           </Show>
         </div>
@@ -583,6 +621,21 @@ const DestinationCard: Component<{
   const [pollingInterval, setPollingInterval] = createSignal<ReturnType<typeof setInterval> | null>(
     null,
   );
+  // Runaway guard for run-status polling; kept in a plain variable so
+  // onCleanup can clear it (it used to be a fire-and-forget setTimeout that
+  // survived unmount and killed polling mid-backup after five minutes).
+  let pollingFallbackTimeout: ReturnType<typeof setTimeout> | null = null;
+
+  const stopRunPolling = (interval: ReturnType<typeof setInterval>) => {
+    clearInterval(interval);
+    if (pollingFallbackTimeout) {
+      clearTimeout(pollingFallbackTimeout);
+      pollingFallbackTimeout = null;
+    }
+    if (pollingInterval() === interval) {
+      setPollingInterval(null);
+    }
+  };
 
   const runsQuery = useQuery(() => ({
     queryKey: [
@@ -600,53 +653,90 @@ const DestinationCard: Component<{
   // A 'local' destination's run sits at 'ready_for_download' once the server
   // has the envelope built — nothing more happens until this claims it. Track
   // which run ids we've already started claiming so a re-poll while the fetch
-  // is still in flight doesn't fire it a second time.
+  // is still in flight doesn't fire it a second time. Failed attempts release
+  // the claim after a short backoff so a transient failure (e.g. the poll
+  // racing the server registering the envelope) retries instead of silently
+  // losing the backup; genuine expiry ends on its own once the server marks
+  // the run failed and it leaves ready_for_download.
   const claimedRunIds = new Set<string>();
-  createEffect(on(
-    () => runsQuery.data?.runs,
-    (runs) => {
-      if (props.destination.driver !== 'local' || !runs) {
-        return;
-      }
-      for (const run of runs) {
-        if (run.status !== 'ready_for_download' || claimedRunIds.has(run.id)) {
-          continue;
+  const lastClaimAttemptAt = new Map<string, number>();
+  const claimRetryTimers: ReturnType<typeof setTimeout>[] = [];
+  const CLAIM_RETRY_DELAY_MS = 5_000;
+
+  onCleanup(() => {
+    for (const timer of claimRetryTimers) {
+      clearTimeout(timer);
+    }
+  });
+
+  const scheduleClaimRetry = (runId: string) => {
+    claimedRunIds.delete(runId);
+    const timer = setTimeout(() => {
+      void refetchRuns();
+    }, CLAIM_RETRY_DELAY_MS);
+    claimRetryTimers.push(timer);
+  };
+
+  createEffect(
+    on(
+      () => runsQuery.data?.runs,
+      (runs) => {
+        if (props.destination.driver !== 'local' || !runs) {
+          return;
         }
-        claimedRunIds.add(run.id);
-        void (async () => {
-          const [blob, error] = await safely(
-            fetchReadyBackupRun({
-              organizationId: props.organizationId,
-              destinationId: props.destination.id,
-              runId: run.id,
-            }),
-          );
-          if (error) {
-            createToast({ type: 'error', message: props.getErrorMessage({ error }) });
+        for (const run of runs) {
+          if (run.status !== 'ready_for_download' || claimedRunIds.has(run.id)) {
+            continue;
+          }
+          const lastAttemptAt = lastClaimAttemptAt.get(run.id);
+          if (lastAttemptAt && Date.now() - lastAttemptAt < CLAIM_RETRY_DELAY_MS) {
+            continue;
+          }
+          lastClaimAttemptAt.set(run.id, Date.now());
+          claimedRunIds.add(run.id);
+          void (async () => {
+            const [blob, error] = await safely(
+              fetchReadyBackupRun({
+                organizationId: props.organizationId,
+                destinationId: props.destination.id,
+                runId: run.id,
+              }),
+            );
+            if (error) {
+              createToast({ type: 'error', message: props.getErrorMessage({ error }) });
+              scheduleClaimRetry(run.id);
+              return;
+            }
+            const fileName =
+              run.remoteFileName ??
+              `papra-backup-${new Date().toISOString().replace(/[:.]/g, '-')}.papra-backup`;
+            const [saveResult, saveError] = await safely(saveBlobToDisk({ blob, fileName }));
+            if (saveError) {
+              // The envelope was consumed server-side by the claim, but the
+              // bytes are already here in memory — fall back to a plain anchor
+              // download rather than losing them.
+              const url = URL.createObjectURL(blob);
+              downloadFile({ url, fileName });
+              URL.revokeObjectURL(url);
+              createToast({
+                type: 'info',
+                message: "Saved to your browser's downloads folder instead.",
+              });
+            } else if (saveResult.cancelled) {
+              createToast({
+                type: 'info',
+                message:
+                  "Download cancelled — the backup was already built though, so it's marked as done. Run it again if you still want a copy.",
+              });
+            } else {
+              createToast({ type: 'success', message: 'Backup saved' });
+            }
             await refetchRuns();
-            return;
-          }
-          const fileName = run.remoteFileName
-            ?? `papra-backup-${new Date().toISOString().replace(/[:.]/g, '-')}.papra-backup`;
-          const [saveResult, saveError] = await safely(saveBlobToDisk({ blob, fileName }));
-          if (saveError) {
-            createToast({ type: 'error', message: props.getErrorMessage({ error: saveError }) });
-            await refetchRuns();
-            return;
-          }
-          if (saveResult.cancelled) {
-            createToast({
-              type: 'info',
-              message: 'Download cancelled — the backup was already built though, so it\'s marked as done. Run it again if you still want a copy.',
-            });
-          } else {
-            createToast({ type: 'success', message: 'Backup saved' });
-          }
-          await refetchRuns();
-        })();
-      }
-    },
-  ));
+          })();
+        }
+      },
+    ),
+  );
 
   const invalidateRuns = () =>
     queryClient.invalidateQueries({
@@ -672,11 +762,14 @@ const DestinationCard: Component<{
       ],
     });
 
-  // Clean up polling interval when component unmounts
+  // Clean up polling timers when component unmounts
   onCleanup(() => {
     const interval = pollingInterval();
     if (interval) {
       clearInterval(interval);
+    }
+    if (pollingFallbackTimeout) {
+      clearTimeout(pollingFallbackTimeout);
     }
   });
 
@@ -717,16 +810,20 @@ const DestinationCard: Component<{
 
   const hasPendingOrUploadingRuns = () => {
     const runs = runsQuery.data?.runs ?? [];
-    return runs.some((run) =>
-      run.status === 'pending' || run.status === 'packaging' || run.status === 'uploading' || run.status === 'ready_for_download');
+    return runs.some(
+      (run) =>
+        run.status === 'pending' ||
+        run.status === 'packaging' ||
+        run.status === 'uploading' ||
+        run.status === 'ready_for_download',
+    );
   };
 
   const handleRunNow = async () => {
-    // Clear any existing polling interval
+    // Clear any existing polling timers
     const existingInterval = pollingInterval();
     if (existingInterval) {
-      clearInterval(existingInterval);
-      setPollingInterval(null);
+      stopRunPolling(existingInterval);
     }
 
     setIsRunning(true);
@@ -748,23 +845,20 @@ const DestinationCard: Component<{
       void refetchRuns().then(() => {
         // Stop polling when there are no more pending or uploading runs
         if (!hasPendingOrUploadingRuns()) {
-          clearInterval(interval);
-          setPollingInterval(null);
+          stopRunPolling(interval);
         }
       });
     }, 2000);
     setPollingInterval(interval);
 
-    // Clear polling after a reasonable time (e.g., 5 minutes) as a fallback
-    setTimeout(
-      () => {
-        if (pollingInterval() === interval) {
-          clearInterval(interval);
-          setPollingInterval(null);
-        }
-      },
-      5 * 60 * 1000,
-    );
+    // Poll until the run reaches a terminal state — a fixed five-minute cutoff
+    // used to freeze the progress bar on longer backups while the server was
+    // still working. Keep only a generous one-hour runaway guard (the server's
+    // stale-run reaper is the real safety net for stuck rows).
+    if (pollingFallbackTimeout) {
+      clearTimeout(pollingFallbackTimeout);
+    }
+    pollingFallbackTimeout = setTimeout(() => stopRunPolling(interval), 60 * 60 * 1000);
   };
 
   const handleDeleteDestination = async () => {
@@ -865,7 +959,10 @@ const DestinationCard: Component<{
     // in the header takes over from here (progress, ETA, and the completion
     // toast), so there's nothing left to await on this page.
     registerRestoreJob({ organizationId: props.organizationId, jobId: result.jobId });
-    createToast({ type: 'success', message: 'Restore started — see the progress indicator in the header' });
+    createToast({
+      type: 'success',
+      message: 'Restore started — see the progress indicator in the header',
+    });
   };
 
   return (
@@ -904,7 +1001,8 @@ const DestinationCard: Component<{
             when={props.destination.driver !== 'local'}
             fallback={
               <p class="text-sm text-muted-foreground">
-                Local folder backups save straight to your browser, so they can't run on a schedule — use "Run backup now" instead.
+                Local folder backups save straight to your browser, so they can't run on a schedule
+                — use "Run backup now" instead.
               </p>
             }
           >
@@ -997,7 +1095,9 @@ const DestinationCard: Component<{
                           <div class="mt-1 max-w-48">
                             <Show
                               when={progress.percent !== null}
-                              fallback={<p class="text-xs text-muted-foreground">{progress.label}</p>}
+                              fallback={
+                                <p class="text-xs text-muted-foreground">{progress.label}</p>
+                              }
                             >
                               <Progress value={progress.percent ?? 0} minValue={0} maxValue={100} />
                               <p class="text-xs text-muted-foreground mt-0.5">{progress.label}</p>
@@ -1103,7 +1203,10 @@ const RecoverFromDestinationDialog: Component<{
       return;
     }
     registerRestoreJob({ organizationId: props.organizationId, jobId: result.jobId });
-    createToast({ type: 'success', message: 'Restore started — see the progress indicator in the header' });
+    createToast({
+      type: 'success',
+      message: 'Restore started — see the progress indicator in the header',
+    });
     props.onRestored();
     setIsOpen(false);
   };

@@ -91,48 +91,97 @@ export function registerGoogleDriveOAuthRoutes({
       const { code, state, error } = context.req.valid('query');
       const redirectBase = (config.appBaseUrl ?? config.client.baseUrl).replace(/\/+$/, '');
 
-      if (error || !code || !state) {
-        return context.redirect(
-          `${redirectBase}/organizations?backupError=google_drive_oauth_denied`,
-        );
+      // Land the person back on their org's backups page with a query flag the
+      // page converts into a toast. Previously success redirected to "/" and
+      // failures to /organizations with a param nothing ever read — the whole
+      // OAuth round-trip ended in silence either way.
+      const redirectToBackupsPage = ({
+        organizationId,
+        backupConnected,
+        backupError,
+      }: {
+        organizationId?: string;
+        backupConnected?: boolean;
+        backupError?: string;
+      }) => {
+        const searchParams = new URLSearchParams();
+        if (backupError) {
+          searchParams.set('backupError', backupError);
+        } else if (backupConnected) {
+          searchParams.set('backupConnected', '1');
+        }
+        const queryString = searchParams.toString();
+        const path = organizationId
+          ? `/organizations/${organizationId}/settings/backups`
+          : '/organizations';
+        return context.redirect(`${redirectBase}${path}${queryString ? `?${queryString}` : ''}`);
+      };
+
+      const statePayload = state ? await oauthStateStore.get(state) : undefined;
+      // One-time use: burn the state as soon as it's been read.
+      if (state && statePayload) {
+        await oauthStateStore.delete(state);
       }
 
-      const statePayload = await oauthStateStore.get(state);
-      if (!statePayload) {
-        return context.redirect(
-          `${redirectBase}/organizations?backupError=google_drive_oauth_expired`,
-        );
+      if (error || !code) {
+        return redirectToBackupsPage({
+          organizationId: statePayload?.organizationId,
+          backupError: 'google_drive_oauth_denied',
+        });
       }
-      await oauthStateStore.delete(state);
+
+      if (!statePayload) {
+        return redirectToBackupsPage({ backupError: 'google_drive_oauth_expired' });
+      }
 
       const oauth = createGoogleDriveOAuthService({ config });
-      const tokens = await oauth.exchangeCodeForTokens({ code });
+
+      let tokens;
+      try {
+        tokens = await oauth.exchangeCodeForTokens({ code });
+      } catch {
+        return redirectToBackupsPage({
+          organizationId: statePayload.organizationId,
+          backupError: 'google_drive_oauth_failed',
+        });
+      }
 
       if (!tokens.refresh_token) {
         // Happens if the user had already granted consent before and Google
         // skips issuing a new refresh token. Since we always pass prompt=consent
         // this shouldn't normally happen, but fail loudly if it does rather than
         // silently storing a destination with no way to refresh.
-        return context.redirect(
-          `${redirectBase}/organizations?backupError=google_drive_no_refresh_token`,
-        );
+        return redirectToBackupsPage({
+          organizationId: statePayload.organizationId,
+          backupError: 'google_drive_no_refresh_token',
+        });
       }
 
       const services = createBackupsServices({ config });
       const repository = createBackupsRepository({ db });
 
-      const { destinationId } = await createDestinationUsecase({
-        config,
-        services,
-        repository,
-        organizationId: statePayload.organizationId,
-        driver: 'google_drive',
-        displayName: statePayload.displayName,
-        credentials: { refreshToken: tokens.refresh_token },
-        settings: {},
-      });
+      try {
+        await createDestinationUsecase({
+          config,
+          services,
+          repository,
+          organizationId: statePayload.organizationId,
+          driver: 'google_drive',
+          displayName: statePayload.displayName,
+          credentials: { refreshToken: tokens.refresh_token },
+          settings: {},
+        });
+      } catch {
+        return redirectToBackupsPage({
+          organizationId: statePayload.organizationId,
+          backupError: 'google_drive_oauth_failed',
+        });
+      }
 
-      return context.redirect(`${redirectBase}/`);
+      return redirectToBackupsPage({
+        organizationId: statePayload.organizationId,
+        backupConnected: true,
+      });
     },
   );
 }

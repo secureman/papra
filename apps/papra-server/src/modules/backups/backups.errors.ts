@@ -68,3 +68,11 @@ export const createBackupUnknownDriverError = createErrorFactory({
   statusCode: 400,
 });
 
+// Thrown when a file handed to restore doesn't even look like a backup
+// envelope (too short / corrupt length prefix) — a clean 400 instead of an
+// opaque Buffer RangeError bubbling up as a 500.
+export const createBackupInvalidFileError = createErrorFactory({
+  message: 'This file is not a valid Papra backup file.',
+  code: 'backups.invalid_file',
+  statusCode: 400,
+});

@@ -25,6 +25,7 @@ import {
   RESTORE_PROGRESS_PERSIST_INTERVAL_MS,
   STALE_IN_PROGRESS_RESTORE_JOB_TIMEOUT_MS,
   STALE_IN_PROGRESS_RUN_TIMEOUT_MS,
+  STALE_READY_FOR_DOWNLOAD_RUN_TIMEOUT_MS,
 } from './backups.constants';
 import {
   packBackupEnvelope,
@@ -269,8 +270,21 @@ export async function runBackupUsecase({
 
   await repository.markStaleInProgressRunsAsFailed({
     destinationId,
+    statuses: ['pending', 'packaging', 'uploading'],
     staleBefore: new Date(Date.now() - STALE_IN_PROGRESS_RUN_TIMEOUT_MS),
     errorMessage: 'Backup marked as failed because the previous run did not complete.',
+  });
+
+  // Local runs waiting to be claimed keep their envelope in memory only — if
+  // the server restarted, that envelope is gone forever and nothing will ever
+  // transition the row again. Reap them just past the client-side download TTL
+  // so they don't sit at ready_for_download forever (which also keeps the
+  // destination's "Run now" button disabled in the UI).
+  await repository.markStaleInProgressRunsAsFailed({
+    destinationId,
+    statuses: ['ready_for_download'],
+    staleBefore: new Date(Date.now() - STALE_READY_FOR_DOWNLOAD_RUN_TIMEOUT_MS),
+    errorMessage: 'Backup was ready but never downloaded — open the backups page and run it again.',
   });
 
   // The insert itself is the concurrency guard: the partial unique index on
@@ -470,6 +484,11 @@ function createBackupProgressReporter({
 }) {
   let lastPackagingPersistedAt = 0;
   let lastUploadPersistedAt = 0;
+  // Progress only ever moves forward — persisting an older value after a newer
+  // one (async writes can complete out of order) makes the client's bar jump
+  // backwards, so skip anything that isn't strictly increasing.
+  let lastPackagingDocumentsCount = -1;
+  let lastUploadedBytes = -1;
 
   const onPackagingStart = async ({
     documentsCount,
@@ -493,20 +512,34 @@ function createBackupProgressReporter({
     processedBytes: number;
   }): void => {
     const now = Date.now();
-    if (now - lastPackagingPersistedAt < BACKUP_PROGRESS_PERSIST_INTERVAL_MS) {
+    if (
+      processedDocumentsCount <= lastPackagingDocumentsCount ||
+      now - lastPackagingPersistedAt < BACKUP_PROGRESS_PERSIST_INTERVAL_MS
+    ) {
       return;
     }
+    lastPackagingDocumentsCount = processedDocumentsCount;
     lastPackagingPersistedAt = now;
-    void repository.updateRunProgress({ runId, fields: { processedDocumentsCount, processedBytes } });
+    repository
+      .updateRunProgress({ runId, fields: { processedDocumentsCount, processedBytes } })
+      .catch((error) =>
+        logger.error({ error, runId }, 'Failed to persist backup packaging progress'),
+      );
   };
 
   const onUploadProgress = ({ uploadedBytes }: { uploadedBytes: number }): void => {
     const now = Date.now();
-    if (now - lastUploadPersistedAt < BACKUP_PROGRESS_PERSIST_INTERVAL_MS) {
+    if (
+      uploadedBytes <= lastUploadedBytes ||
+      now - lastUploadPersistedAt < BACKUP_PROGRESS_PERSIST_INTERVAL_MS
+    ) {
       return;
     }
+    lastUploadedBytes = uploadedBytes;
     lastUploadPersistedAt = now;
-    void repository.updateRunProgress({ runId, fields: { uploadedBytes } });
+    repository
+      .updateRunProgress({ runId, fields: { uploadedBytes } })
+      .catch((error) => logger.error({ error, runId }, 'Failed to persist backup upload progress'));
   };
 
   return { onPackagingStart, onPackagingProgress, onUploadProgress };
@@ -568,28 +601,43 @@ async function runBackupPipeline({
     // envelope to the in-memory delivery service and wait for the client's
     // browser to claim it, instead of calling driver.uploadFile at all.
     if (isLocalDestination) {
-      await repository.updateRunStatus({
-        runId,
-        status: 'ready_for_download',
-        fields: { documentsCount, totalSizeBytes: envelope.length },
-      });
+      // Register the envelope BEFORE flipping the status. The client polls for
+      // status === 'ready_for_download' and immediately hits the download
+      // endpoint, so flipping first leaves a race window where a claim 404s
+      // because the envelope isn't registered yet.
       services.localDelivery.holdForDownload({
         runId,
         envelope,
         fileName,
         organizationId,
         onExpire: () => {
-          void repository.updateRunStatus({
-            runId,
-            status: 'failed',
-            fields: {
-              errorMessage: 'Backup was ready but never downloaded — open the backups page and run it again.',
-              completedAt: new Date(),
-            },
-          });
+          repository
+            .updateRunStatus({
+              runId,
+              status: 'failed',
+              fields: {
+                errorMessage:
+                  'Backup was ready but never downloaded — open the backups page and run it again.',
+                completedAt: new Date(),
+              },
+            })
+            .catch((updateError) => {
+              logger.error(
+                { error: updateError, runId },
+                'Failed to mark expired local backup run as failed',
+              );
+            });
         },
       });
-      logger.info({ runId, destinationId, size: envelope.length, documentsCount }, 'Backup ready for client download');
+      await repository.updateRunStatus({
+        runId,
+        status: 'ready_for_download',
+        fields: { documentsCount, totalSizeBytes: envelope.length },
+      });
+      logger.info(
+        { runId, destinationId, size: envelope.length, documentsCount },
+        'Backup ready for client download',
+      );
       return;
     }
 
@@ -634,14 +682,20 @@ async function runBackupPipeline({
     );
   } catch (error) {
     logger.error({ error, runId, destinationId }, 'Backup run failed');
-    await repository.updateRunStatus({
-      runId,
-      status: 'failed',
-      fields: {
-        errorMessage: (error as Error)?.message?.slice(0, 500) ?? 'Unknown error',
-        completedAt: new Date(),
-      },
-    });
+    // The whole pipeline runs fire-and-forget (`void runBackupPipeline(...)`),
+    // so a throwing status write here would escape as an unhandled rejection.
+    try {
+      await repository.updateRunStatus({
+        runId,
+        status: 'failed',
+        fields: {
+          errorMessage: (error as Error)?.message?.slice(0, 500) ?? 'Unknown error',
+          completedAt: new Date(),
+        },
+      });
+    } catch (updateError) {
+      logger.error({ error: updateError, runId }, 'Failed to persist failed status for backup run');
+    }
   }
 }
 
@@ -1096,6 +1150,7 @@ function createRestoreProgressReporter({
   let lastPersistedAt = 0;
   let lastPersistedCount = -1;
   let lastDownloadPersistedAt = 0;
+  let lastDownloadedBytes = -1;
 
   const onDownloadStart = async (): Promise<void> => {
     await repository.updateRestoreJob({
@@ -1113,14 +1168,22 @@ function createRestoreProgressReporter({
     totalBytes: number | null;
   }): void => {
     const now = Date.now();
-    if (now - lastDownloadPersistedAt < RESTORE_PROGRESS_PERSIST_INTERVAL_MS) {
+    if (
+      downloadedBytes <= lastDownloadedBytes ||
+      now - lastDownloadPersistedAt < RESTORE_PROGRESS_PERSIST_INTERVAL_MS
+    ) {
       return;
     }
+    lastDownloadedBytes = downloadedBytes;
     lastDownloadPersistedAt = now;
     // Fire-and-forget: this runs inside the driver's streaming read loop,
     // which shouldn't be slowed down waiting on a DB write for a progress
     // update that's inherently best-effort anyway.
-    void repository.updateRestoreJob({ jobId, fields: { downloadedBytes, totalBytes } });
+    repository
+      .updateRestoreJob({ jobId, fields: { downloadedBytes, totalBytes } })
+      .catch((error) =>
+        logger.error({ error, jobId }, 'Failed to persist restore download progress'),
+      );
   };
 
   const onManifestReady = async ({
@@ -1158,7 +1221,10 @@ function createRestoreProgressReporter({
     }
     lastPersistedAt = now;
     lastPersistedCount = processedCount;
-    await repository.updateRestoreJob({ jobId, fields: { processedDocumentsCount: processedCount } });
+    await repository.updateRestoreJob({
+      jobId,
+      fields: { processedDocumentsCount: processedCount },
+    });
   };
 
   return { onDownloadStart, onDownloadProgress, onManifestReady, onProgress };
@@ -1184,9 +1250,7 @@ async function runRestoreJobPipeline({
   repository: BackupsRepository;
   jobId: string;
   logger?: Logger;
-  execute: (
-    reporter: ReturnType<typeof createRestoreProgressReporter>,
-  ) => Promise<RestoreOutcome>;
+  execute: (reporter: ReturnType<typeof createRestoreProgressReporter>) => Promise<RestoreOutcome>;
 }): Promise<void> {
   const reporter = createRestoreProgressReporter({ repository, jobId });
 
@@ -1209,14 +1273,23 @@ async function runRestoreJobPipeline({
     providedLogger.info({ jobId, ...result }, 'Restore job completed');
   } catch (error) {
     providedLogger.error({ error, jobId }, 'Restore job failed');
-    await repository.updateRestoreJob({
-      jobId,
-      status: 'failed',
-      fields: {
-        errorMessage: (error as Error)?.message?.slice(0, 500) ?? 'Unknown error',
-        completedAt: new Date(),
-      },
-    });
+    // Same fire-and-forget exposure as the backup pipeline: a throwing write
+    // here must never escape as an unhandled rejection.
+    try {
+      await repository.updateRestoreJob({
+        jobId,
+        status: 'failed',
+        fields: {
+          errorMessage: (error as Error)?.message?.slice(0, 500) ?? 'Unknown error',
+          completedAt: new Date(),
+        },
+      });
+    } catch (updateError) {
+      providedLogger.error(
+        { error: updateError, jobId },
+        'Failed to persist failed status for restore job',
+      );
+    }
   }
 }
 
@@ -1349,7 +1422,10 @@ export async function downloadReadyBackupRunUsecase({
     status: 'succeeded',
     fields: { remoteFileName: claimed.fileName, completedAt: new Date() },
   });
-  await repository.updateDestination({ destinationId: run.destinationId, fields: { lastRunAt: new Date() } });
+  await repository.updateDestination({
+    destinationId: run.destinationId,
+    fields: { lastRunAt: new Date() },
+  });
 
   return { envelope: claimed.envelope, fileName: claimed.fileName };
 }
@@ -1731,7 +1807,6 @@ export async function verifyBackupRunUsecase({
   config,
   services,
   repository,
-  documentsStorageService,
   organizationId,
   destinationId,
   runId,
@@ -1739,7 +1814,6 @@ export async function verifyBackupRunUsecase({
   config: Config;
   services: BackupsServices;
   repository: BackupsRepository;
-  documentsStorageService: import('../documents/storage/documents.storage.services').DocumentStorageService;
   organizationId: string;
   destinationId: string;
   runId: string;

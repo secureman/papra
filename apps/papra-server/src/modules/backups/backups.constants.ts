@@ -21,6 +21,11 @@ export const BACKUP_FILE_MIME_TYPE = 'application/octet-stream';
 export const STALE_IN_PROGRESS_RUN_TIMEOUT_MS = 24 * 60 * 60 * 1_000;
 export const STALE_IN_PROGRESS_RESTORE_JOB_TIMEOUT_MS = 24 * 60 * 60 * 1_000;
 
+// Local-destination runs at 'ready_for_download' are only claimable while the
+// built envelope is alive in memory (client-side TTL is 10 minutes) — reap them
+// shortly after that so a server restart doesn't leave them stuck forever.
+export const STALE_READY_FOR_DOWNLOAD_RUN_TIMEOUT_MS = 15 * 60 * 1_000;
+
 // How often the restore pipeline persists processedDocumentsCount to the DB.
 // Every single document would hammer sqlite on a large restore for no real UX
 // gain; this keeps writes cheap while still feeling live to a polling client.

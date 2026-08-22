@@ -3,12 +3,17 @@ import * as v from 'valibot';
 import { requireAuthentication } from '../app/auth/auth.middleware';
 import { getUser } from '../app/auth/auth.models';
 import { createDocumentsRepository } from '../documents/documents.repository';
+import { isDocumentSizeLimitEnabled } from '../documents/documents.models';
 import { createFoldersRepository } from '../folders/folders.repository';
 import { organizationIdSchema } from '../organizations/organization.schemas';
 import { createOrganizationsRepository } from '../organizations/organizations.repository';
 import { ensureUserIsInOrganization } from '../organizations/organizations.usecases';
+import { createPlanEntitlementsRepository } from '../plan-entitlements/plan-entitlements.repository';
+import { createPlansRepository } from '../plans/plans.repository';
+import { getOrganizationPlan } from '../plans/plans.usecases';
 import { getFileStreamFromMultipartForm } from '../shared/streams/file-upload';
 import { validateJsonBody, validateParams } from '../shared/validation/validation';
+import { createSubscriptionsRepository } from '../subscriptions/subscriptions.repository';
 import {
   backupDestinationIdRegex,
   backupRestoreJobIdRegex,
@@ -498,9 +503,28 @@ function setupRestoreFromUploadedFileRoute(deps: RouteDefinitionContext) {
       const organizationsRepository = createOrganizationsRepository({ db });
       await ensureUserIsInOrganization({ userId, organizationId, organizationsRepository });
 
+      // Cap the uploaded backup file at the org's plan-based document upload
+      // limit — previously this route accepted unbounded bodies and buffered
+      // the whole file into memory.
+      const plansRepository = createPlansRepository({ config });
+      const subscriptionsRepository = createSubscriptionsRepository({ db });
+      const planEntitlementsRepository = createPlanEntitlementsRepository({ db });
+
+      const { organizationPlan } = await getOrganizationPlan({
+        organizationId,
+        plansRepository,
+        subscriptionsRepository,
+        planEntitlementsRepository,
+        planEntitlementDefinitionRegistry: deps.planEntitlementDefinitionRegistry,
+      });
+      const { maxFileSize } = organizationPlan.limits;
+
       const { fileStream } = await getFileStreamFromMultipartForm({
         body: context.req.raw.body,
         headers: Object.fromEntries(context.req.raw.headers.entries()),
+        maxFileSize: isDocumentSizeLimitEnabled({ maxUploadSize: maxFileSize })
+          ? maxFileSize
+          : undefined,
       });
 
       const chunks: Buffer[] = [];
@@ -617,7 +641,7 @@ function setupDownloadReadyRunRoute({ app, config, db }: RouteDefinitionContext)
 }
 
 // Verify the integrity of a backup run by checking document hashes
-function setupVerifyRunRoute({ app, config, db, documentsStorageService }: RouteDefinitionContext) {
+function setupVerifyRunRoute({ app, config, db }: RouteDefinitionContext) {
   app.post(
     '/api/organizations/:organizationId/backups/destinations/:destinationId/runs/:runId/verify',
     requireAuthentication(),
@@ -642,7 +666,6 @@ function setupVerifyRunRoute({ app, config, db, documentsStorageService }: Route
         config,
         services,
         repository,
-        documentsStorageService,
         organizationId,
         destinationId,
         runId,

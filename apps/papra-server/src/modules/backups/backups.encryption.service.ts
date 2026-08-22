@@ -1,7 +1,7 @@
 import type { Config } from '../config/config.types';
 import { randomBytes } from 'node:crypto';
 import { decrypt, encrypt } from '../shared/crypto/encryption';
-import { createBackupsNotConfiguredError } from './backups.errors';
+import { createBackupsNotConfiguredError, createBackupInvalidFileError } from './backups.errors';
 
 // Every backup destination gets its own random 256-bit key (the "DEK"). The DEK
 // is wrapped with the server-wide KEK (BACKUPS_KEK) and stored on the destination
@@ -117,7 +117,16 @@ export function unpackBackupEnvelope({ envelope }: { envelope: Buffer }): {
   wrappedKey: string;
   encryptedPayload: Buffer;
 } {
+  // Validate the framing before touching it — a truncated or non-envelope file
+  // would otherwise throw an opaque Buffer RangeError instead of a clean,
+  // user-facing "not a backup file" error.
+  if (envelope.length < 4) {
+    throw createBackupInvalidFileError();
+  }
   const keyLength = envelope.readUInt32BE(0);
+  if (keyLength === 0 || keyLength > envelope.length - 4) {
+    throw createBackupInvalidFileError();
+  }
   const wrappedKey = envelope.subarray(4, 4 + keyLength).toString('utf8');
   const encryptedPayload = envelope.subarray(4 + keyLength);
   return { wrappedKey, encryptedPayload };

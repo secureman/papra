@@ -23,6 +23,10 @@ import { isNil } from '../shared/utils';
 
 const BLOCK_SIZE = 512;
 const FILE_MODE_REGULAR = 0o644;
+// Classic ustar stores the whole path in a single 100-byte name field (we
+// don't implement the prefix split), and the size field is 12 octal digits.
+const MAX_ENTRY_NAME_LENGTH = 100;
+const MAX_ENTRY_SIZE_BYTES = 8 * 1024 * 1024 * 1024 - 1;
 
 type TarEntry = { name: string; content: Buffer };
 
@@ -88,6 +92,22 @@ function buildEntryHeader({ name, size }: { name: string; size: number }): Buffe
 
 // Pack an array of entries into a single Buffer (the tarball bytes).
 function packTar(entries: TarEntry[]): Buffer {
+  for (const entry of entries) {
+    // Fail loudly rather than silently truncating: a truncated name could
+    // collide with another entry's name or break the id-prefix matching the
+    // restore and verify flows rely on.
+    if (Buffer.byteLength(entry.name, 'utf8') > MAX_ENTRY_NAME_LENGTH) {
+      throw new Error(
+        `Backup entry name exceeds ${MAX_ENTRY_NAME_LENGTH} characters and cannot be stored in the archive: "${entry.name}"`,
+      );
+    }
+    if (entry.content.length > MAX_ENTRY_SIZE_BYTES) {
+      throw new Error(
+        `Backup entry exceeds the ${MAX_ENTRY_SIZE_BYTES}-byte archive size limit: "${entry.name}"`,
+      );
+    }
+  }
+
   const blocks: Buffer[] = [];
   for (const entry of entries) {
     blocks.push(buildEntryHeader({ name: entry.name, size: entry.content.length }));

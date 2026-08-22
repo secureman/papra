@@ -61,6 +61,16 @@ function parsePropfindHrefs(xml: string): string[] {
   return matches.map((m) => decodeURIComponent(m[1]!.trim()));
 }
 
+// Some servers emit hrefs with stray or malformed escapes — a failed decode
+// shouldn't take down the whole listing.
+function tryDecodePathname(pathname: string): string {
+  try {
+    return decodeURIComponent(pathname);
+  } catch {
+    return pathname;
+  }
+}
+
 export const webdavBackupDriverFactory = defineBackupDriver(() => {
   async function request({
     settings,
@@ -224,13 +234,17 @@ export const webdavBackupDriverFactory = defineBackupDriver(() => {
 
       return {
         files: hrefs
-          .map((href) => new URL(href, root).pathname)
-          .filter((p) => p.replace(/\/+$/, '') !== `${rootPath}/${folderRef}`.replace(/\/+$/, ''))
+          // Decode to raw paths here and keep remoteFileId decoded: every
+          // driver call re-encodes path segments exactly once via
+          // encodePathSegments/joinUrl, so storing percent-encoded values
+          // would end up double-encoded (%20 → %2520) on GET/DELETE.
+          .map((href) => tryDecodePathname(new URL(href, root).pathname))
+          .filter((p) => p.replace(/\/+$/, '') !== `${rootPath}/${folderRef}`)
           .filter((p) => !p.endsWith('/')) // directories/collections
           .filter((p) => p.endsWith(BACKUP_FILE_EXTENSION)) // ignore anything else parked in the folder
           .map((p) => ({
             remoteFileId: p.slice(rootPath.length).replace(/^\/+/, ''),
-            name: decodeURIComponent(p.split('/').pop() ?? p),
+            name: p.split('/').pop() ?? p,
           })),
       };
     },
