@@ -32,18 +32,20 @@ export const googleDriveBackupDriverFactory = defineBackupDriver(({ config }) =>
     refreshToken,
     url,
     init,
+    accessToken: preFetchedAccessToken,
   }: {
     refreshToken: string;
     url: string;
     init: RequestInit;
+    // Lets a caller that already fetched a token moments ago (e.g. the
+    // upload session-init call, immediately followed by the PUT) reuse it
+    // instead of paying for another round trip to Google's OAuth endpoint.
+    accessToken?: string;
   }): Promise<Response> {
-    const accessToken = await getAccessToken({ refreshToken });
+    const accessToken = preFetchedAccessToken ?? (await getAccessToken({ refreshToken }));
 
     const timeoutController = new AbortController();
-    const timeoutId = setTimeout(
-      () => timeoutController.abort(),
-      GOOGLE_DRIVE_REQUEST_TIMEOUT_MS,
-    );
+    const timeoutId = setTimeout(() => timeoutController.abort(), GOOGLE_DRIVE_REQUEST_TIMEOUT_MS);
 
     let response: Response;
     try {
@@ -123,11 +125,13 @@ export const googleDriveBackupDriverFactory = defineBackupDriver(({ config }) =>
 
     // Resumable upload: start a session, then PUT the bytes. Handles backups
     // larger than the 5MB multipart-upload ceiling.
-    async uploadFile({ credentials, folderRef, fileName, mimeType, content }) {
+    async uploadFile({ credentials, folderRef, fileName, mimeType, content, onProgress }) {
       const refreshToken = credentials.refreshToken!;
+      const accessToken = await getAccessToken({ refreshToken });
 
       const sessionInitResponse = await authorizedFetch({
         refreshToken,
+        accessToken,
         url: `${GOOGLE_DRIVE_UPLOAD_ENDPOINT}?uploadType=resumable`,
         init: {
           method: 'POST',
@@ -140,15 +144,54 @@ export const googleDriveBackupDriverFactory = defineBackupDriver(({ config }) =>
         throw createBackupDriverApiError();
       }
 
-      const accessToken = await getAccessToken({ refreshToken });
-      const uploadResponse = await fetch(sessionUri, {
+      // Stream the body in chunks (rather than one opaque Buffer) so
+      // onProgress fires as undici pulls each slice — same trick as the
+      // WebDAV driver. Node's fetch (undici) requires `duplex: 'half'` for a
+      // streamed request body; when nobody listens for progress we pass the
+      // Buffer directly and skip that complexity.
+      //
+      // Content-Length is set explicitly even for the streamed body: we
+      // already know the full size (`content` is a complete in-memory
+      // Buffer), so there's no reason to make undici fall back to chunked
+      // Transfer-Encoding. Uploading without a declared length forces
+      // Google's resumable-upload backend to treat it as an unknown-size
+      // stream, which negotiates in smaller internal writes instead of one
+      // contiguous transfer — on a high-latency link that per-write
+      // round-trip cost is the difference between "slow" and "as fast as
+      // the connection allows".
+      let uploadInit: RequestInit = {
         method: 'PUT',
         headers: {
           'Content-Type': mimeType || GOOGLE_DRIVE_BACKUP_FILE_MIME_TYPE,
+          'Content-Length': String(content.length),
           'Authorization': `Bearer ${accessToken}`,
         },
         body: content,
-      });
+      };
+      if (onProgress) {
+        const CHUNK_SIZE = 256 * 1024;
+        let offset = 0;
+        const bodyStream = new ReadableStream<Uint8Array>({
+          pull(controller) {
+            if (offset >= content.length) {
+              controller.close();
+              return;
+            }
+            const end = Math.min(offset + CHUNK_SIZE, content.length);
+            controller.enqueue(content.subarray(offset, end));
+            offset = end;
+            onProgress({ uploadedBytes: offset });
+          },
+        });
+        uploadInit = {
+          ...uploadInit,
+          body: bodyStream,
+          // `duplex` isn't in the standard RequestInit typings.
+          duplex: 'half',
+        } as RequestInit;
+      }
+
+      const uploadResponse = await fetch(sessionUri, uploadInit);
       if (!uploadResponse.ok) {
         const body = await uploadResponse.text();
         logger.error({ status: uploadResponse.status, body }, 'Google Drive upload failed');
@@ -205,7 +248,10 @@ export const googleDriveBackupDriverFactory = defineBackupDriver(({ config }) =>
         }
       } catch (error) {
         await reader.cancel().catch(() => {});
-        logger.error({ url, downloadedBytes, totalBytes }, 'Google Drive download stalled or failed');
+        logger.error(
+          { url, downloadedBytes, totalBytes },
+          'Google Drive download stalled or failed',
+        );
         throw error;
       }
 

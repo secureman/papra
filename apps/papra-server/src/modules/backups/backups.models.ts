@@ -1,5 +1,46 @@
 import type { BackupSchedule } from './backups.types';
 
+// Archive entry names ride in ustar tar headers whose final path segment can't
+// exceed 100 bytes (see splitUstarPath in backups.packager.service.ts). Entry
+// names are `{documentId}-{sanitized original name}` under a `files/` folder,
+// so the whole basename must stay within that budget.
+export const BACKUP_ENTRY_FILE_NAME_MAX_LENGTH = 100;
+
+// Builds a tar-safe archive entry name for a backed-up document. Uniqueness
+// comes from the document id prefix (the manifest keeps the true name), so
+// when a sanitized original name doesn't fit it gets trimmed — keeping the
+// extension so restored files stay recognizable. Sanitization collapses
+// everything outside [\w.-] to '_', which is ASCII-only, hence string length
+// equals byte length.
+export function buildBackupEntryFileName({
+  documentId,
+  originalName,
+}: {
+  documentId: string;
+  originalName: string;
+}): string {
+  const sanitized = originalName.replace(/[^\w.-]/g, '_') || 'document';
+  const fullName = `${documentId}-${sanitized}`;
+
+  if (fullName.length <= BACKUP_ENTRY_FILE_NAME_MAX_LENGTH) {
+    return fullName;
+  }
+
+  // Preserve the extension (text after the last dot) when there's room for it.
+  const dotIndex = sanitized.lastIndexOf('.');
+  const extension = dotIndex > 0 ? sanitized.slice(dotIndex) : '';
+  const basePart = dotIndex > 0 ? sanitized.slice(0, dotIndex) : sanitized;
+  const baseBudget = Math.max(
+    1,
+    BACKUP_ENTRY_FILE_NAME_MAX_LENGTH - documentId.length - 1 - extension.length,
+  );
+  const trimmedBase = basePart.slice(0, baseBudget);
+
+  // Belt and braces for pathological extensions longer than the whole budget:
+  // hard-trim to the limit with the document id prefix kept intact.
+  return `${documentId}-${trimmedBase}${extension}`.slice(0, BACKUP_ENTRY_FILE_NAME_MAX_LENGTH);
+}
+
 // Finds the next Date (>= `from`) matching the schedule's days-of-week + time.
 // Server-local time throughout — kept simple deliberately (see backups.config.ts
 // doc comment); if you run the server in a different timezone than you want

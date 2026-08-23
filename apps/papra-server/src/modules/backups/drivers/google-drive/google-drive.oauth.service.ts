@@ -1,3 +1,4 @@
+import { setDefaultResultOrder } from 'node:dns';
 import type { Config } from '../../../config/config.types';
 import { createLogger } from '../../../shared/logger/logger';
 import {
@@ -15,6 +16,38 @@ import {
 // Hand-rolled OAuth2 helper (no `googleapis` dep — we only need 3 endpoints).
 
 const logger = createLogger({ namespace: 'backups:drivers:google-drive:oauth' });
+
+// Node's default DNS result order interleaves A/AAAA (Happy Eyeballs), so a
+// request can attempt the IPv6 address first. On hosts with broken or
+// carrier-blocked IPv6 (e.g. mobile networks, some self-hosted setups behind
+// NAT) that first attempt eats the whole connect-timeout window before ever
+// trying IPv4, which is indistinguishable from "Google is unreachable" in the
+// logs. Preferring IPv4 avoids paying that tax on every OAuth request. This
+// only needs to run once per process.
+setDefaultResultOrder('ipv4first');
+
+// A raw TCP connect timeout (no SYN-ACK within undici's connect window) is
+// usually transient — a dropped packet, a momentarily congested path, a NAT
+// table hiccup — not a permanent outage. Retrying a couple of times with a
+// short backoff turns a one-off blip into a successful request instead of
+// failing the whole OAuth flow (or an unattended backup run) outright.
+const TOKEN_ENDPOINT_MAX_ATTEMPTS = 3;
+const TOKEN_ENDPOINT_RETRY_DELAY_MS = 500;
+
+function isRetryableNetworkError(error: unknown): boolean {
+  const cause = (error as TypeError & { cause?: { code?: string } })?.cause;
+  const code = cause?.code;
+  return (
+    code === 'UND_ERR_CONNECT_TIMEOUT' ||
+    code === 'ETIMEDOUT' ||
+    code === 'ECONNRESET' ||
+    code === 'EAI_AGAIN'
+  );
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 type TokenResponse = {
   access_token: string;
@@ -50,27 +83,54 @@ export function createGoogleDriveOAuthService({ config }: { config: Config }) {
   }: {
     params: Record<string, string>;
   }): Promise<TokenResponse> {
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), GOOGLE_DRIVE_OAUTH_REQUEST_TIMEOUT_MS);
+    let response: Response | undefined;
+    let lastError: unknown;
 
-    let response: Response;
-    try {
-      response = await fetch(GOOGLE_DRIVE_OAUTH_TOKEN_ENDPOINT, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body: new URLSearchParams(params),
-        signal: controller.signal,
-      });
-    } catch (error) {
-      logger.error({ error }, 'Failed to reach the Google OAuth token endpoint');
+    for (let attempt = 1; attempt <= TOKEN_ENDPOINT_MAX_ATTEMPTS; attempt += 1) {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), GOOGLE_DRIVE_OAUTH_REQUEST_TIMEOUT_MS);
+
+      try {
+        response = await fetch(GOOGLE_DRIVE_OAUTH_TOKEN_ENDPOINT, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: new URLSearchParams(params),
+          signal: controller.signal,
+        });
+        lastError = undefined;
+        break;
+      } catch (error) {
+        lastError = error;
+        const retryable = isRetryableNetworkError(error) && attempt < TOKEN_ENDPOINT_MAX_ATTEMPTS;
+        const cause = (error as TypeError & { cause?: { code?: string; message?: string } }).cause;
+        const causeSummary = cause ? `${cause.code ?? ''} ${cause.message ?? ''}`.trim() : '';
+        logger.error(
+          { error, cause: causeSummary || undefined, attempt, willRetry: retryable },
+          'Failed to reach the Google OAuth token endpoint',
+        );
+        if (!retryable) {
+          break;
+        }
+        await sleep(TOKEN_ENDPOINT_RETRY_DELAY_MS * attempt);
+      } finally {
+        clearTimeout(timeoutId);
+      }
+    }
+
+    if (lastError || !response) {
+      // undici wraps the real failure (DNS, timeout, connection reset...) in
+      // `error.cause` — surfacing it here and in the thrown message is the
+      // difference between "fetch failed" and an actionable diagnosis.
+      const cause = (lastError as TypeError & { cause?: { code?: string; message?: string } })?.cause;
+      const causeSummary = cause ? `${cause.code ?? ''} ${cause.message ?? ''}`.trim() : '';
       throw createBackupDriverOAuthError({
         message:
-          'Could not reach the Google OAuth endpoint. Check the server\'s internet connection ' +
+          'Could not reach the Google OAuth endpoint' +
+          (causeSummary ? ` (${causeSummary})` : '') +
+          ". Check the server's internet connection " +
           'and try again. If this persists, reconnect the destination from the web app.',
-        cause: error,
+        cause: lastError,
       });
-    } finally {
-      clearTimeout(timeoutId);
     }
 
     if (!response.ok) {

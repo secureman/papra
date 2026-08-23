@@ -19,8 +19,8 @@ export const LOCAL_DRIVER_NAME = 'local' as const;
 
 function unsupported(method: string): never {
   throw new Error(
-    `Local backup destinations don't support ${method} — the file lives on your device, not on the server. `
-    + `Use the download prompt on the backups page instead.`,
+    `Local backup destinations don't support ${method} — the file lives on your device, not on the server. ` +
+      `Use the download prompt on the backups page instead.`,
   );
 }
 

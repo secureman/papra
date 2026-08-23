@@ -38,7 +38,9 @@ function invalidateBackupsQueries({ organizationId }: { organizationId: string }
 }
 
 function describeOutcome({ job }: { job: BackupRestoreJob }) {
-  const parts = [`Restored ${job.restoredDocumentsCount ?? 0}/${job.totalDocumentsCount ?? 0} documents`];
+  const parts = [
+    `Restored ${job.restoredDocumentsCount ?? 0}/${job.totalDocumentsCount ?? 0} documents`,
+  ];
   if (job.untrashedDocumentsCount) {
     parts.push(`${job.untrashedDocumentsCount} untrashed`);
   }
@@ -66,13 +68,10 @@ function formatEtaLabel(remainingMs: number): string {
 // Not every driver reports byte progress (some just buffer the whole download
 // with no size known up front) — in that case this falls back to a plain
 // "still downloading" label with no percent, same as before.
-function estimateDownloadEta({
-  job,
-  now,
-}: {
-  job: BackupRestoreJob;
-  now: number;
-}): { label: string; percent: number | null } {
+function estimateDownloadEta({ job, now }: { job: BackupRestoreJob; now: number }): {
+  label: string;
+  percent: number | null;
+} {
   const { downloadedBytes, totalBytes, startedAt } = job;
 
   if (downloadedBytes === null || downloadedBytes === 0) {
@@ -95,13 +94,10 @@ function estimateDownloadEta({
   return { label: `${sizeLabel} · ${formatEtaLabel(remainingMs)}`, percent };
 }
 
-export function estimateRestoreEta({
-  job,
-  now,
-}: {
-  job: BackupRestoreJob;
-  now: number;
-}): { label: string; percent: number | null } {
+export function estimateRestoreEta({ job, now }: { job: BackupRestoreJob; now: number }): {
+  label: string;
+  percent: number | null;
+} {
   const total = job.totalDocumentsCount;
   const processed = job.processedDocumentsCount;
 
@@ -169,7 +165,13 @@ export const RestoreProgressProvider: ParentComponent<{ organizationId: string }
     }
   };
 
-  const settleJob = ({ job, organizationId }: { job: BackupRestoreJob; organizationId: string }) => {
+  const settleJob = ({
+    job,
+    organizationId,
+  }: {
+    job: BackupRestoreJob;
+    organizationId: string;
+  }) => {
     stopPolling();
     setActiveJob(null);
     invalidateBackupsQueries({ organizationId });

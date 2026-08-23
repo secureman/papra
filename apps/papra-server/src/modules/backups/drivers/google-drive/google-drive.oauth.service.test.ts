@@ -1,8 +1,6 @@
 import { afterEach, describe, expect, test, vi } from 'vitest';
 import type { Config } from '../../../config/config.types';
-import {
-  createGoogleDriveOAuthService,
-} from './google-drive.oauth.service';
+import { createGoogleDriveOAuthService } from './google-drive.oauth.service';
 import type { GoogleDriveOAuthService } from './google-drive.oauth.service';
 import { GOOGLE_DRIVE_OAUTH_TOKEN_ENDPOINT } from './google-drive.constants';
 
@@ -81,28 +79,30 @@ describe('google drive oauth service', () => {
         ),
       );
 
-      await expect(
-        createService().refreshAccessToken({ refreshToken: 'rt' }),
-      ).rejects.toThrowError(/invalid_grant/);
-      await expect(
-        createService().refreshAccessToken({ refreshToken: 'rt' }),
-      ).rejects.toThrowError(/Token has been expired or revoked/);
-      await expect(
-        createService().refreshAccessToken({ refreshToken: 'rt' }),
-      ).rejects.toThrowError(/reconnect/i);
+      await expect(createService().refreshAccessToken({ refreshToken: 'rt' })).rejects.toThrowError(
+        /invalid_grant/,
+      );
+      await expect(createService().refreshAccessToken({ refreshToken: 'rt' })).rejects.toThrowError(
+        /Token has been expired or revoked/,
+      );
+      await expect(createService().refreshAccessToken({ refreshToken: 'rt' })).rejects.toThrowError(
+        /reconnect/i,
+      );
     });
 
     test('includes the HTTP status when the body is not JSON', async () => {
       vi.stubGlobal(
         'fetch',
-        vi.fn().mockResolvedValue(
-          createResponse({ ok: false, status: 502, body: '<html>proxy error</html>' }),
-        ),
+        vi
+          .fn()
+          .mockResolvedValue(
+            createResponse({ ok: false, status: 502, body: '<html>proxy error</html>' }),
+          ),
       );
 
-      await expect(
-        createService().refreshAccessToken({ refreshToken: 'rt' }),
-      ).rejects.toThrowError(/502/);
+      await expect(createService().refreshAccessToken({ refreshToken: 'rt' })).rejects.toThrowError(
+        /502/,
+      );
     });
 
     test('fails loudly when the token endpoint is unreachable', async () => {
@@ -111,9 +111,9 @@ describe('google drive oauth service', () => {
         vi.fn().mockRejectedValue(new Error('fetch failed (network unreachable)')),
       );
 
-      await expect(
-        createService().refreshAccessToken({ refreshToken: 'rt' }),
-      ).rejects.toThrowError(/could not reach/i);
+      await expect(createService().refreshAccessToken({ refreshToken: 'rt' })).rejects.toThrowError(
+        /could not reach/i,
+      );
     });
   });
 
