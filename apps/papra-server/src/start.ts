@@ -11,6 +11,8 @@ import { createEventServices } from './modules/app/events/events.services';
 import { createGracefulShutdownService } from './modules/app/graceful-shutdown/graceful-shutdown.services';
 import { getProcessMode } from './modules/app/process.models';
 import { createServer } from './modules/app/server';
+import { createBackupsRepository } from './modules/backups/backups.repository';
+import { reapOrphanedBackupRunsAndJobsUsecase } from './modules/backups/backups.usecases';
 import { parseConfig } from './modules/config/config';
 import { createDocumentSearchServices } from './modules/documents/document-search/document-search.registry';
 import { createDocumentStorageService } from './modules/documents/storage/documents.storage.services';
@@ -86,6 +88,21 @@ async function buildServices({ config }: { config: Config }): Promise<GlobalDepe
     config,
     webhookTriggerServices,
   });
+
+  // Reap any backup run / restore job left in an in-progress status by a
+  // previous process that never shut down cleanly (kill -9, crash, power
+  // loss, container restart). Must run before the server/worker starts
+  // accepting requests, since a run stuck at "uploading" also blocks a fresh
+  // run from being created for that destination (see backups.usecases.ts).
+  // Best-effort: a failure here shouldn't prevent the app from starting.
+  try {
+    await reapOrphanedBackupRunsAndJobsUsecase({ repository: createBackupsRepository({ db }) });
+  } catch (error) {
+    createLogger({ namespace: 'app-server' }).error(
+      { error },
+      'Failed to reap orphaned backup runs/restore jobs on startup',
+    );
+  }
 
   return {
     config,

@@ -34,6 +34,7 @@ export function createBackupsRepository({ db }: { db: Database }) {
       updateRunStatus,
       deleteRun,
       markStaleInProgressRunsAsFailed,
+      reapAllOrphanedRunsAndJobs,
       // Restore jobs
       createRestoreJob,
       getRestoreJobById,
@@ -323,6 +324,40 @@ async function markStaleInProgressRunsAsFailed({
     )
     .returning({ id: backupRunsTable.id });
   return { markedCount: result.length };
+}
+
+// Reaps every run left in an in-progress status, across all destinations and
+// organizations, with no age check. Meant to run once at process boot: every
+// run/job pipeline in this codebase is fire-and-forget in-process (no
+// persisted job queue), so if the process is starting up fresh, anything
+// still marked in-progress in the DB is provably orphaned — the process that
+// was supposed to finish it is gone (killed, crashed, power loss), not just
+// running long. Waiting for the normal 24h staleness window in that case
+// means the row (and the UI's "uploading" status) is stuck until a user
+// happens to trigger a new run on that same destination, which is what
+// leaves things looking permanently hung after a hard restart.
+async function reapAllOrphanedRunsAndJobs({
+  errorMessage,
+  restoreJobErrorMessage,
+  db,
+}: {
+  errorMessage: string;
+  restoreJobErrorMessage: string;
+  db: Database;
+}): Promise<{ markedRunsCount: number; markedJobsCount: number }> {
+  const runResult = await db
+    .update(backupRunsTable)
+    .set({ status: 'failed', errorMessage, completedAt: new Date() })
+    .where(inArray(backupRunsTable.status, ['pending', 'packaging', 'uploading', 'ready_for_download']))
+    .returning({ id: backupRunsTable.id });
+
+  const jobResult = await db
+    .update(backupRestoreJobsTable)
+    .set({ status: 'failed', errorMessage: restoreJobErrorMessage, completedAt: new Date() })
+    .where(inArray(backupRestoreJobsTable.status, ['pending', 'downloading', 'restoring']))
+    .returning({ id: backupRestoreJobsTable.id });
+
+  return { markedRunsCount: runResult.length, markedJobsCount: jobResult.length };
 }
 
 // ----- Restore jobs -----

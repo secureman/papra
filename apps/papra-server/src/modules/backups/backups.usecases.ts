@@ -240,6 +240,35 @@ export async function listRunsUsecase({
 
 // ----- Run a backup -----
 
+// Called once at process boot (see start.ts), before anything can create a
+// new run/job. Every backup and restore pipeline in this codebase is
+// fire-and-forget in-process — there's no persisted job queue that could
+// pick a run back up after a restart — so any row still sitting in an
+// in-progress status at boot time is guaranteed orphaned: the process that
+// owned it is gone. Reaping them immediately (rather than waiting for the
+// usual 24h staleness window) means a killed/crashed server doesn't leave
+// the UI stuck showing "uploading" forever, and doesn't leave the
+// destination's partial unique index blocking a fresh run from starting.
+export async function reapOrphanedBackupRunsAndJobsUsecase({
+  repository,
+  logger: providedLogger = logger,
+}: {
+  repository: BackupsRepository;
+  logger?: Logger;
+}): Promise<void> {
+  const { markedRunsCount, markedJobsCount } = await repository.reapAllOrphanedRunsAndJobs({
+    errorMessage: 'Backup was interrupted by a server restart and could not be resumed. Please try again.',
+    restoreJobErrorMessage:
+      'Restore was interrupted by a server restart and could not be resumed. Please try again.',
+  });
+  if (markedRunsCount > 0 || markedJobsCount > 0) {
+    providedLogger.info(
+      { markedRunsCount, markedJobsCount },
+      'Reaped orphaned backup runs/restore jobs left in-progress from before the last restart',
+    );
+  }
+}
+
 export async function runBackupUsecase({
   config,
   services,
