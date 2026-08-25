@@ -602,19 +602,44 @@ async function runBackupPipeline({
   runId: string;
   logger: Logger;
 }): Promise<void> {
-  const { destination } = await repository.getDestinationById({ destinationId, organizationId });
-  if (!destination) {
-    return;
-  }
-
-  const credentials = unwrapCredentials({ encryption, wrapped: destination.encryptedCredentials });
-  const dek = encryption.unwrapWithKek({ wrapped: destination.wrappedBackupKey });
-  const settings = JSON.parse(destination.settingsJson) as Record<string, unknown>;
-  const driver = services.getDriver(destination.driver);
-  const isLocalDestination = destination.driver === 'local';
-  const progress = createBackupProgressReporter({ repository, runId });
-
+  // Everything from here on can reject — DB hiccups, credential/backup-key
+  // unwrap failures (e.g. the server BACKUPS_KEK changed after the
+  // destination was created), malformed settings JSON, unknown drivers. The
+  // pipeline runs fire-and-forget (`void runBackupPipeline(...)`), so any
+  // rejection escaping this function surfaces as an unhandled promise
+  // rejection, which the global handler treats as fatal and shuts the whole
+  // server down. Every fallible statement therefore lives inside the try so
+  // failures land in run history instead of killing the process.
   try {
+    const { destination } = await repository.getDestinationById({ destinationId, organizationId });
+    if (!destination) {
+      return;
+    }
+
+    let credentials: Record<string, string>;
+    let dek: Buffer;
+    try {
+      credentials = unwrapCredentials({ encryption, wrapped: destination.encryptedCredentials });
+      dek = encryption.unwrapWithKek({ wrapped: destination.wrappedBackupKey });
+    } catch (unwrapError) {
+      throw new Error(
+        `Failed to decrypt the destination's stored credentials or backup key. `
+        + `The server's BACKUPS_KEK likely changed since this destination was created `
+        + `— delete and re-create the destination. [${(unwrapError as Error)?.message ?? 'unknown error'}]`,
+      );
+    }
+
+    let settings: Record<string, unknown>;
+    try {
+      settings = JSON.parse(destination.settingsJson) as Record<string, unknown>;
+    } catch {
+      throw new Error('The destination\'s stored settings are corrupted (invalid JSON).');
+    }
+
+    const driver = services.getDriver(destination.driver);
+    const isLocalDestination = destination.driver === 'local';
+    const progress = createBackupProgressReporter({ repository, runId });
+
     const { envelope, documentsCount } = await buildEncryptedBackupEnvelope({
       organizationId,
       documentsRepository,
