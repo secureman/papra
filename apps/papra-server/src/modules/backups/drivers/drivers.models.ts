@@ -53,13 +53,19 @@ export type BackupDriver = {
     folderRef: string;
     fileName: string;
     mimeType: string;
-    content: Buffer;
+    // Either an in-memory buffer or a stream (e.g. reading the spooled
+    // envelope from disk) — streaming keeps peak memory flat no matter how
+    // large the backup is.
+    content: Buffer | ReadableStream<Uint8Array>;
+    // Total size in bytes. REQUIRED when `content` is a stream (there's no
+    // .length to read); drivers use it for Content-Length / size negotiation.
+    // Optional with a Buffer (defaults to content.length).
+    contentLength?: number;
     // Optional: drivers that can report byte-level progress while sending
     // (FTP via basic-ftp's trackProgress, chunked/streamed HTTP PUTs) should
-    // call this periodically with bytes sent so far. `content.length` is
-    // always the total, so callers don't need a separate total here. Drivers
-    // that only support a single all-at-once request can ignore this — the
-    // upload still works, it just jumps straight from 0% to 100%.
+    // call this periodically with bytes sent so far. Drivers that only
+    // support a single all-at-once request can ignore this — the upload
+    // still works, it just jumps straight from 0% to 100%.
     onProgress?: (args: { uploadedBytes: number }) => void;
   }) => Promise<{ remoteFileId: string; remoteFileName: string }>;
 

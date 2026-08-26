@@ -8,6 +8,10 @@ import type { BackupsRepository } from './backups.repository';
 import type { BackupsServices } from './backups.services';
 import type { BackupRunTrigger, BackupSchedule } from './backups.types';
 import { Readable as NodeReadable } from 'node:stream';
+import { createReadStream, createWriteStream } from 'node:fs';
+import { stat } from 'node:fs/promises';
+import { pipeline } from 'node:stream/promises';
+import { createGzip } from 'node:zlib';
 import { createDocumentActivityRepository } from '../documents/document-activity/document-activity.repository';
 import { createDocumentCreationUsecase, restoreDocument } from '../documents/documents.usecases';
 import { createFoldersRepository } from '../folders/folders.repository';
@@ -32,7 +36,6 @@ import {
   STALE_READY_FOR_DOWNLOAD_RUN_TIMEOUT_MS,
 } from './backups.constants';
 import {
-  packBackupEnvelope,
   unpackBackupEnvelope,
   unwrapCredentials,
   wrapCredentials,
@@ -46,6 +49,11 @@ import {
   createBackupsNotConfiguredError,
 } from './backups.errors';
 import type { BackupDriverName } from './drivers/drivers.registry';
+import {
+  createEnvelopeSpoolPath,
+  deleteEnvelopeSpoolFile,
+} from './backups.envelope-spool';
+import { createTarPackTransform } from './backups.packager.service';
 
 const logger = createLogger({ namespace: 'backups:usecases' });
 
@@ -424,11 +432,20 @@ async function buildBackupManifest({
 // Everything from "fetch the org's documents" through "produce an encrypted,
 // self-contained envelope" — shared by destination-based backups and by a
 // direct "download a backup copy" with no destination involved at all.
-async function buildEncryptedBackupEnvelope({
+//
+// To keep peak memory flat (a 300 MB org previously buffered every document,
+// then the tarball, the gzip output and the encrypted payload on top — ~700 MB
+// of RSS that OOM-killed small self-hosted servers like a Termux/udocker box),
+// the envelope is STREAMED to a spool file on disk (see backups.envelope-spool.ts):
+// tar → gzip → encryption are piped with real backpressure, so at most ONE
+// document is held in memory at a time regardless of library size.
+//
+// The caller OWNS the spool file: it must be uploaded / streamed to a client /
+// handed to local delivery, and is responsible for deleting it afterwards.
+async function spoolEncryptedBackupEnvelope({
   organizationId,
   documentsRepository,
   documentsStorageService,
-  services,
   encryption,
   dek,
   db,
@@ -439,7 +456,6 @@ async function buildEncryptedBackupEnvelope({
   organizationId: string;
   documentsRepository: DocumentsRepository;
   documentsStorageService: import('../documents/storage/documents.storage.services').DocumentStorageService;
-  services: BackupsServices;
   encryption: NonNullable<BackupsServices['encryption']>;
   dek: Buffer;
   db: import('../app/database/database.types').Database;
@@ -455,57 +471,95 @@ async function buildEncryptedBackupEnvelope({
     processedDocumentsCount: number;
     processedBytes: number;
   }) => void | Promise<void>;
-}): Promise<{ envelope: Buffer; documentsCount: number }> {
-  const { documents: docs } =
+}): Promise<{ spoolPath: string; size: number; documentsCount: number }> {
+  const { documents } =
     await documentsRepository.getAllOrganizationUndeletedDocumentsForBackup({ organizationId });
 
-  const totalRawBytes = docs.reduce((sum, d) => sum + (d.originalSize ?? 0), 0);
-  await onStart?.({ documentsCount: docs.length, totalRawBytes });
+  const totalRawBytes = documents.reduce((sum, d) => sum + (d.originalSize ?? 0), 0);
+  await onStart?.({ documentsCount: documents.length, totalRawBytes });
 
-  const files: { name: string; content: Buffer }[] = [];
+  const manifest = await buildBackupManifest({ organizationId, docs: documents, db });
+
+  const spoolPath = createEnvelopeSpoolPath();
+  const wrappedKey = encryption.wrapWithKek({ value: dek });
+  const wrappedKeyBuffer = Buffer.from(wrappedKey, 'utf8');
+
+  // Envelope framing (see backups.encryption.service): [4-byte big-endian
+  // wrapped-key length][wrapped key utf8][encrypted payload]. The tiny key
+  // prefix is written straight to the file; the encrypted tar.gz stream is then
+  // appended after it by the pipeline below.
+  const writeStream = createWriteStream(spoolPath);
+  const lengthPrefix = Buffer.alloc(4);
+  lengthPrefix.writeUInt32BE(wrappedKeyBuffer.length, 0);
+  writeStream.write(lengthPrefix);
+  writeStream.write(wrappedKeyBuffer);
+
+  // Lazily read each document and hand it to tar one at a time. Backpressure
+  // flows all the way back from the spool file, so `Readable.from` only pulls
+  // the next document once the previous one has been written to disk — exactly
+  // ONE document resident in memory at any instant. The manifest always comes
+  // first, matching the decoder / unpacker's expectations.
+  const manifestEntry = {
+    name: 'manifest.json',
+    content: Buffer.from(JSON.stringify(manifest, null, 2), 'utf8'),
+  };
+
   let processedBytes = 0;
 
-  for (const [index, doc] of docs.entries()) {
-    try {
-      const { fileStream } = await documentsStorageService.getFileStream({
-        storageKey: doc.originalStorageKey,
-        fileEncryptionAlgorithm: doc.fileEncryptionAlgorithm,
-        fileEncryptionKekVersion: doc.fileEncryptionKekVersion,
-        fileEncryptionKeyWrapped: doc.fileEncryptionKeyWrapped,
-      });
-      const chunks: Buffer[] = [];
-      for await (const chunk of fileStream) {
-        chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  const documentsStream = NodeReadable.from(
+    (async function* () {
+      yield manifestEntry;
+      for (const [index, doc] of documents.entries()) {
+        try {
+          const { fileStream } = await documentsStorageService.getFileStream({
+            storageKey: doc.originalStorageKey,
+            fileEncryptionAlgorithm: doc.fileEncryptionAlgorithm,
+            fileEncryptionKekVersion: doc.fileEncryptionKekVersion,
+            fileEncryptionKeyWrapped: doc.fileEncryptionKeyWrapped,
+          });
+          const chunks: Buffer[] = [];
+          for await (const chunk of fileStream) {
+            chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+          }
+          const content = Buffer.concat(chunks);
+          yield {
+            name: `files/${buildBackupEntryFileName({ documentId: doc.id, originalName: doc.originalName })}`,
+            content,
+          };
+          processedBytes += content.length;
+        } catch (error) {
+          logger.error({ error, documentId: doc.id }, 'Failed to fetch document for backup; skipping');
+          // Still count the (unread) doc's expected size so the bar doesn't stall
+          // short of 100% just because one document failed to fetch.
+          processedBytes += doc.originalSize ?? 0;
+        }
+        await onProgress?.({ processedDocumentsCount: index + 1, processedBytes });
       }
-      const content = Buffer.concat(chunks);
-      files.push({
-        name: buildBackupEntryFileName({ documentId: doc.id, originalName: doc.originalName }),
-        content,
-      });
-      processedBytes += content.length;
-    } catch (error) {
-      logger.error({ error, documentId: doc.id }, 'Failed to fetch document for backup; skipping');
-      // Still count the (unread) doc's expected size so the bar doesn't stall
-      // short of 100% just because one document failed to fetch.
-      processedBytes += doc.originalSize ?? 0;
-    }
-    await onProgress?.({ processedDocumentsCount: index + 1, processedBytes });
+    })(),
+    { objectMode: true },
+  );
+
+  try {
+    await pipeline(
+      documentsStream,
+      createTarPackTransform(),
+      createGzip(),
+      encryption.createPayloadEncryptStream({ key: dek }),
+      writeStream,
+    );
+  } catch (error) {
+    // Failed mid-packaging — don't leak the partially-written spool file.
+    await deleteEnvelopeSpoolFile({ path: spoolPath });
+    throw error;
   }
 
-  const manifest = await buildBackupManifest({ organizationId, docs, db });
+  const { size } = await stat(spoolPath);
 
-  const archive = await services.packager.pack({ manifest, files });
-  const encrypted = encryption.encryptPayload({ payload: archive, key: dek });
-  const envelope = packBackupEnvelope({
-    wrappedKey: encryption.wrapWithKek({ value: dek }),
-    encryptedPayload: encrypted,
-  });
-
-  return { envelope, documentsCount: docs.length };
+  return { spoolPath, size, documentsCount: documents.length };
 }
 
 // Mirrors createRestoreProgressReporter below: wires the packaging/upload
-// callbacks in buildEncryptedBackupEnvelope + driver.uploadFile onto the run
+// callbacks in spoolEncryptedBackupEnvelope + driver.uploadFile onto the run
 // row, throttled, so the client's poll actually gets a moving percentage
 // instead of a status word that sits still for however long each phase takes.
 function createBackupProgressReporter({
@@ -640,11 +694,10 @@ async function runBackupPipeline({
     const isLocalDestination = destination.driver === 'local';
     const progress = createBackupProgressReporter({ repository, runId });
 
-    const { envelope, documentsCount } = await buildEncryptedBackupEnvelope({
+    const { spoolPath, size, documentsCount } = await spoolEncryptedBackupEnvelope({
       organizationId,
       documentsRepository,
       documentsStorageService,
-      services,
       encryption,
       dek,
       db,
@@ -656,16 +709,19 @@ async function runBackupPipeline({
     const fileName = `papra-backup-${organizationId.slice(-6)}-${new Date().toISOString().replace(/[:.]/g, '-')}${BACKUP_FILE_EXTENSION}`;
 
     // Local destinations have nowhere server-side to upload to — hand the
-    // envelope to the in-memory delivery service and wait for the client's
-    // browser to claim it, instead of calling driver.uploadFile at all.
+    // spool file to the delivery service and wait for the client's poll to
+    // notice status === 'ready_for_download' and claim it, instead of calling
+    // driver.uploadFile at all. Ownership of the spool file transfers to the
+    // delivery service: it deletes it on expiry, discard() or a successful claim.
     if (isLocalDestination) {
-      // Register the envelope BEFORE flipping the status. The client polls for
+      // Register the spool file BEFORE flipping the status. The client polls for
       // status === 'ready_for_download' and immediately hits the download
       // endpoint, so flipping first leaves a race window where a claim 404s
-      // because the envelope isn't registered yet.
+      // because the spool file isn't registered yet.
       services.localDelivery.holdForDownload({
         runId,
-        envelope,
+        filePath: spoolPath,
+        size,
         fileName,
         organizationId,
         onExpire: () => {
@@ -690,10 +746,10 @@ async function runBackupPipeline({
       await repository.updateRunStatus({
         runId,
         status: 'ready_for_download',
-        fields: { documentsCount, totalSizeBytes: envelope.length },
+        fields: { documentsCount, totalSizeBytes: size },
       });
       logger.info(
-        { runId, destinationId, size: envelope.length, documentsCount },
+        { runId, destinationId, size, documentsCount },
         'Backup ready for client download',
       );
       return;
@@ -702,7 +758,7 @@ async function runBackupPipeline({
     await repository.updateRunStatus({
       runId,
       status: 'uploading',
-      fields: { documentsCount, totalSizeBytes: envelope.length, uploadedBytes: 0 },
+      fields: { documentsCount, totalSizeBytes: size, uploadedBytes: 0 },
     });
 
     let folderRef = destination.remoteFolderRef;
@@ -712,15 +768,26 @@ async function runBackupPipeline({
       await repository.updateDestination({ destinationId, fields: { remoteFolderRef: folderRef } });
     }
 
-    const uploaded = await driver.uploadFile({
-      credentials,
-      settings,
-      folderRef,
-      fileName,
-      mimeType: BACKUP_FILE_MIME_TYPE,
-      content: envelope,
-      onProgress: progress.onUploadProgress,
-    });
+    // Stream the spooled envelope straight to the driver instead of buffering:
+    // content is a web ReadableStream reading from the spool file, and the
+    // driver is told the exact byte count so Content-Length is declared upfront.
+    let uploaded: { remoteFileId: string; remoteFileName: string };
+    try {
+      uploaded = await driver.uploadFile({
+        credentials,
+        settings,
+        folderRef,
+        fileName,
+        mimeType: BACKUP_FILE_MIME_TYPE,
+        content: NodeReadable.toWeb(createReadStream(spoolPath)),
+        contentLength: size,
+        onProgress: progress.onUploadProgress,
+      });
+    } finally {
+      // Free the spool file whether the upload succeeded or died mid-flight —
+      // the data has been handed to the driver by now.
+      await deleteEnvelopeSpoolFile({ path: spoolPath });
+    }
 
     await repository.updateRunStatus({
       runId,
@@ -728,14 +795,14 @@ async function runBackupPipeline({
       fields: {
         remoteFileId: uploaded.remoteFileId,
         remoteFileName: uploaded.remoteFileName,
-        uploadedBytes: envelope.length,
+        uploadedBytes: size,
         completedAt: new Date(),
       },
     });
     await repository.updateDestination({ destinationId, fields: { lastRunAt: new Date() } });
 
     logger.info(
-      { runId, destinationId, size: envelope.length, documentsCount },
+      { runId, destinationId, size, documentsCount },
       'Backup run completed',
     );
   } catch (error) {
@@ -1428,16 +1495,15 @@ export async function downloadBackupCopyUsecase({
   organizationId: string;
   db: import('../app/database/database.types').Database;
   logger?: Logger;
-}): Promise<{ envelope: Buffer; fileName: string; documentsCount: number }> {
+}): Promise<{ spoolPath: string; size: number; fileName: string; documentsCount: number }> {
   assertBackupsConfigured({ config });
   const encryption = services.requireEncryption();
   const dek = encryption.generateBackupKey();
 
-  const { envelope, documentsCount } = await buildEncryptedBackupEnvelope({
+  const { spoolPath, size, documentsCount } = await spoolEncryptedBackupEnvelope({
     organizationId,
     documentsRepository,
     documentsStorageService,
-    services,
     encryption,
     dek,
     db,
@@ -1446,13 +1512,15 @@ export async function downloadBackupCopyUsecase({
 
   const fileName = `papra-backup-${organizationId.slice(-6)}-${new Date().toISOString().replace(/[:.]/g, '-')}${BACKUP_FILE_EXTENSION}`;
 
-  return { envelope, fileName, documentsCount };
+  return { spoolPath, size, fileName, documentsCount };
 }
 
 // ----- Claim the envelope of a 'local' destination run that's sitting at
 // 'ready_for_download' (see runBackupPipeline + backups.local-delivery.service).
-// One-shot: the envelope is gone from memory after this resolves, whether or
-// not the caller actually finishes streaming it to the response. -----
+// One-shot: after this resolves, ownership of the spool FILE transfers to the
+// CALLER, which must stream it to the client and then delete it — whether or
+// not it actually finishes. The delivery service has already removed its
+// reference, so a second claim runs into a 404. -----
 export async function downloadReadyBackupRunUsecase({
   services,
   repository,
@@ -1463,7 +1531,7 @@ export async function downloadReadyBackupRunUsecase({
   repository: BackupsRepository;
   organizationId: string;
   runId: string;
-}): Promise<{ envelope: Buffer; fileName: string }> {
+}): Promise<{ spoolPath: string; size: number; fileName: string }> {
   const { run } = await repository.getRunById({ runId, organizationId });
   if (!run || run.status !== 'ready_for_download') {
     throw createBackupRunNotFoundError();
@@ -1485,7 +1553,7 @@ export async function downloadReadyBackupRunUsecase({
     fields: { lastRunAt: new Date() },
   });
 
-  return { envelope: claimed.envelope, fileName: claimed.fileName };
+  return { spoolPath: claimed.filePath, size: claimed.size, fileName: claimed.fileName };
 }
 
 // ----- Restore directly from an uploaded file — no destination, no driver, no

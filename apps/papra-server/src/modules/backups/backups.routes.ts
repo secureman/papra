@@ -1,5 +1,7 @@
 import type { RouteDefinitionContext } from '../app/server.types';
 import * as v from 'valibot';
+import { createReadStream } from 'node:fs';
+import { Readable } from 'node:stream';
 import { requireAuthentication } from '../app/auth/auth.middleware';
 import { getUser } from '../app/auth/auth.models';
 import { createDocumentsRepository } from '../documents/documents.repository';
@@ -20,6 +22,7 @@ import {
   backupRunIdRegex,
 } from './backups.constants';
 import { createBackupsRepository } from './backups.repository';
+import { deleteEnvelopeSpoolFile } from './backups.envelope-spool';
 import { createBackupsServices } from './backups.services';
 import {
   createDestinationUsecase,
@@ -578,7 +581,7 @@ function setupDownloadBackupCopyRoute({
       const services = createBackupsServices({ config });
       const documentsRepository = createDocumentsRepository({ db });
 
-      const { envelope, fileName } = await downloadBackupCopyUsecase({
+      const { spoolPath, size, fileName } = await downloadBackupCopyUsecase({
         config,
         services,
         documentsRepository,
@@ -587,10 +590,18 @@ function setupDownloadBackupCopyRoute({
         db,
       });
 
-      return context.body(new Uint8Array(envelope), 200, {
+      // The envelope was streamed to a spool file (not RAM) to keep peak
+      // memory flat. Stream it straight to the client, then delete the spool
+      // file once the response has been fully handed off.
+      const fileStream = createReadStream(spoolPath);
+      const cleanup = () => void deleteEnvelopeSpoolFile({ path: spoolPath });
+      fileStream.once('end', cleanup);
+      fileStream.once('error', cleanup);
+
+      return context.body(Readable.toWeb(fileStream), 200, {
         'Content-Type': 'application/octet-stream',
         'Content-Disposition': `attachment; filename*=UTF-8''${encodeURIComponent(fileName)}`,
-        'Content-Length': String(envelope.length),
+        'Content-Length': String(size),
         'X-Content-Type-Options': 'nosniff',
         'X-Frame-Options': 'DENY',
       });
@@ -622,17 +633,25 @@ function setupDownloadReadyRunRoute({ app, config, db }: RouteDefinitionContext)
       const services = createBackupsServices({ config });
       const repository = createBackupsRepository({ db });
 
-      const { envelope, fileName } = await downloadReadyBackupRunUsecase({
+      const { spoolPath, size, fileName } = await downloadReadyBackupRunUsecase({
         services,
         repository,
         organizationId,
         runId,
       });
 
-      return context.body(new Uint8Array(envelope), 200, {
+      // Ownership of the spool file has transferred to this route — stream it
+      // to the client, then delete it (on success or failure) so spool files
+      // never accumulate in the temp dir.
+      const fileStream = createReadStream(spoolPath);
+      const cleanup = () => void deleteEnvelopeSpoolFile({ path: spoolPath });
+      fileStream.once('end', cleanup);
+      fileStream.once('error', cleanup);
+
+      return context.body(Readable.toWeb(fileStream), 200, {
         'Content-Type': 'application/octet-stream',
         'Content-Disposition': `attachment; filename*=UTF-8''${encodeURIComponent(fileName)}`,
-        'Content-Length': String(envelope.length),
+        'Content-Length': String(size),
         'X-Content-Type-Options': 'nosniff',
         'X-Frame-Options': 'DENY',
       });

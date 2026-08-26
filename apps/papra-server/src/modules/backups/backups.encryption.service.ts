@@ -1,5 +1,6 @@
 import type { Config } from '../config/config.types';
-import { randomBytes } from 'node:crypto';
+import { createCipheriv, createDecipheriv, randomBytes } from 'node:crypto';
+import { Transform } from 'node:stream';
 import { decrypt, encrypt } from '../shared/crypto/encryption';
 import { createBackupsNotConfiguredError, createBackupInvalidFileError } from './backups.errors';
 
@@ -15,6 +16,11 @@ import { createBackupsNotConfiguredError, createBackupInvalidFileError } from '.
 
 const KEY_LENGTH = 32;
 const ALGORITHM = 'aes-256-gcm';
+// Must match the IV length used by the payload cipher so the streamed output is
+// byte-for-byte decodable by decryptPayload().
+const IV_LENGTH = 12;
+// AES-GCM auth tag length.
+const TAG_LENGTH = 16;
 
 function getKek({ config }: { config: Config }): Buffer {
   const hex = config.backups.kek;
@@ -31,6 +37,16 @@ export interface BackupEncryptionService {
   unwrapWithKek(args: { wrapped: string }): Buffer;
   encryptPayload(args: { payload: Buffer; key: Buffer }): Buffer;
   decryptPayload(args: { encryptedPayload: Buffer; key: Buffer }): Buffer;
+  // Streaming twin of encryptPayload: emits [iv][...ciphertext...][tag], the
+  // exact byte layout encryptPayload() produces, so decryptPayload() and every
+  // existing backup file stay compatible. Lets the envelope builder pipe
+  // tar → gzip → encryption → disk without ever holding the whole archive.
+  //
+  // Note this layout (iv then ciphertext then tag) differs from the *key
+  // wrapping* format (shared crypto `encrypt()`, which is iv→tag→cipher): the
+  // tag can only be computed after all ciphertext, so a single streaming pass
+  // cannot put it first. The payload deliberately uses the streamable order.
+  createPayloadEncryptStream(args: { key: Buffer }): Transform;
 }
 
 export function createBackupEncryptionService({
@@ -57,13 +73,88 @@ export function createBackupEncryptionService({
     },
 
     encryptPayload({ payload, key }: { payload: Buffer; key: Buffer }): Buffer {
-      return encrypt({ key, value: payload });
+      // [iv][ciphertext][tag] — the same layout createPayloadEncryptStream
+      // produces, so both the buffered and streamed paths are interchangeable.
+      const iv = randomBytes(IV_LENGTH);
+      const cipher = createCipheriv(ALGORITHM, key, iv);
+      const encrypted = Buffer.concat([cipher.update(payload), cipher.final()]);
+      return Buffer.concat([iv, encrypted, cipher.getAuthTag()]);
+    },
+
+    createPayloadEncryptStream({ key }: { key: Buffer }): Transform {
+      // Same layout as encryptPayload: fresh random IV written first,
+      // ciphertext streamed through, auth tag appended last.
+      const iv = randomBytes(IV_LENGTH);
+      const cipher = createCipheriv(ALGORITHM, key, iv);
+      let headerWritten = false;
+
+      return new Transform({
+        transform(chunk: Buffer, _encoding, callback) {
+          try {
+            if (!headerWritten) {
+              this.push(iv);
+              headerWritten = true;
+            }
+            const encrypted = cipher.update(chunk);
+            if (encrypted.length > 0) {
+              this.push(encrypted);
+            }
+            callback();
+          } catch (error) {
+            callback(error instanceof Error ? error : new Error(String(error)));
+          }
+        },
+        flush(callback) {
+          try {
+            const final = cipher.final();
+            if (final.length > 0) {
+              this.push(final);
+            }
+            this.push(cipher.getAuthTag());
+            callback();
+          } catch (error) {
+            callback(error instanceof Error ? error : new Error(String(error)));
+          }
+        },
+      });
     },
 
     decryptPayload({ encryptedPayload, key }: { encryptedPayload: Buffer; key: Buffer }): Buffer {
-      return decrypt({ encryptedValue: encryptedPayload, key });
+      // Two payload layouts have existed over the life of the format, and AES-GCM
+      // tag verification reliably picks whichever one a given file actually uses:
+      //   - legacy: [iv][tag][ciphertext]  (old in-RAM builder via shared encrypt())
+      //   - current: [iv][ciphertext][tag] (the streaming producer)
+      // Try the current tag-last layout first, then fall back to legacy.
+      if (encryptedPayload.length < IV_LENGTH + TAG_LENGTH) {
+        throw createBackupInvalidFileError();
+      }
+      try {
+        return decryptPayloadCipherTextLast({ encryptedPayload, key });
+      } catch {
+        return decrypt({ encryptedValue: encryptedPayload, key });
+      }
     },
   };
+}
+
+// [iv][ciphertext][tag] — the layout encryptPayload / createPayloadEncryptStream
+// produce. Decryption side of that layout used as the primary attempt in
+// decryptPayload (see above).
+function decryptPayloadCipherTextLast({
+  encryptedPayload,
+  key,
+}: {
+  encryptedPayload: Buffer;
+  key: Buffer;
+}): Buffer {
+  const iv = encryptedPayload.subarray(0, IV_LENGTH);
+  const ciphertextLength = encryptedPayload.length - IV_LENGTH - TAG_LENGTH;
+  const encryptedBuffer = encryptedPayload.subarray(IV_LENGTH, IV_LENGTH + ciphertextLength);
+  const tag = encryptedPayload.subarray(encryptedPayload.length - TAG_LENGTH);
+
+  const decipher = createDecipheriv(ALGORITHM, key, iv);
+  decipher.setAuthTag(tag);
+  return Buffer.concat([decipher.update(encryptedBuffer), decipher.final()]);
 }
 
 // ----- Credential JSON helpers -----

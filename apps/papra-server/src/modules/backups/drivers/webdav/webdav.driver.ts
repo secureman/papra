@@ -163,40 +163,72 @@ export const webdavBackupDriverFactory = defineBackupDriver(() => {
       return { folderRef: folderPath };
     },
 
-    async uploadFile({ credentials, settings, folderRef, fileName, content, onProgress }) {
+    async uploadFile({ credentials, settings, folderRef, fileName, content, contentLength, onProgress }) {
       const s = settings as unknown as WebdavSettings;
       const path = `${folderRef}/${fileName}`;
-      // Stream the body in chunks (rather than one opaque Buffer) purely so
-      // we can call onProgress as each chunk is pulled — the server still
-      // receives the exact same bytes either way. Falls back to passing the
-      // Buffer directly when nobody's listening for progress, since Node's
-      // fetch requires `duplex: 'half'` for a streamed body and there's no
-      // reason to pay that complexity when it's not needed.
+
+      // `content` may be an in-memory Buffer or a spooled envelope read from
+      // disk (ReadableStream). Normalize to a web ReadableStream so progress
+      // reporting and the wire body look the same for both: a pull-based stream
+      // for Buffers, a passthrough byte counter for real streams.
+      let body: Buffer | ReadableStream<Uint8Array>;
+      const totalBytes = contentLength ?? (content instanceof Buffer ? content.length : undefined);
       if (!onProgress) {
-        await request({ settings: s, credentials, path, method: 'PUT', body: content });
+        // Nobody's listening for progress — pass the body straight through.
+        // Streams still need `duplex: 'half'` on Node's fetch.
+        await request({
+          settings: s,
+          credentials,
+          path,
+          method: 'PUT',
+          body: content,
+          streamDuplex: !(content instanceof Buffer),
+          headers: totalBytes !== undefined ? { 'Content-Length': String(totalBytes) } : undefined,
+        });
         return { remoteFileId: path, remoteFileName: fileName };
       }
-      const CHUNK_SIZE = 256 * 1024;
-      let offset = 0;
-      const body = new ReadableStream<Uint8Array>({
-        pull(controller) {
-          if (offset >= content.length) {
-            controller.close();
-            return;
-          }
-          const end = Math.min(offset + CHUNK_SIZE, content.length);
-          controller.enqueue(content.subarray(offset, end));
-          offset = end;
-          onProgress({ uploadedBytes: offset });
-        },
-      });
+
+      if (content instanceof Buffer) {
+        // Slice the Buffer into chunks so onProgress fires as bytes drain.
+        const CHUNK_SIZE = 256 * 1024;
+        let offset = 0;
+        body = new ReadableStream<Uint8Array>({
+          pull(controller) {
+            if (offset >= content.length) {
+              controller.close();
+              return;
+            }
+            const end = Math.min(offset + CHUNK_SIZE, content.length);
+            controller.enqueue(content.subarray(offset, end));
+            offset = end;
+            onProgress({ uploadedBytes: offset });
+          },
+        });
+      } else {
+        // Count bytes as they pass through to the server. `content` is the
+        // raw spooled-envelope stream; alias it to a stream type explicitly
+        // since TS won't narrow the `Buffer | ReadableStream` union here.
+        const source = content as ReadableStream<Uint8Array>;
+        let uploadedBytes = 0;
+        body = source.pipeThrough(
+          new TransformStream<Uint8Array, Uint8Array>({
+            transform(chunk, controller) {
+              controller.enqueue(chunk);
+              uploadedBytes += chunk.byteLength;
+              onProgress({ uploadedBytes });
+            },
+          }),
+        );
+      }
+
       await request({
         settings: s,
         credentials,
         path,
         method: 'PUT',
-        body: body as unknown as Buffer,
+        body,
         streamDuplex: true,
+        headers: totalBytes !== undefined ? { 'Content-Length': String(totalBytes) } : undefined,
       });
       return { remoteFileId: path, remoteFileName: fileName };
     },

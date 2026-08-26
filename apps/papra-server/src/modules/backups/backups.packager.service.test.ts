@@ -1,6 +1,9 @@
 import { createHash } from 'node:crypto';
 import { describe, expect, test } from 'vitest';
-import { createBackupPackagerService } from './backups.packager.service';
+import { Readable, Writable } from 'node:stream';
+import { pipeline } from 'node:stream/promises';
+import { createGzip } from 'node:zlib';
+import { createBackupPackagerService, createTarPackTransform } from './backups.packager.service';
 
 describe('backups packager service', () => {
   describe('pack / unpack roundtrip', () => {
@@ -106,6 +109,38 @@ describe('backups packager service', () => {
       const foreignGzipArchive = await service.pack({ manifest: {}, files: [] });
       const unpacked = await service.unpack({ archive: foreignGzipArchive });
       expect(unpacked.manifest).toEqual({});
+    });
+  });
+
+  describe('createTarPackTransform (streaming tar)', () => {
+    test('produces a byte stream the buffer unpacker decodes identically', async () => {
+      const service = createBackupPackagerService();
+      const manifest = { schemaVersion: 2, documents: [{ id: 'doc_1', name: 'a' }] };
+      const entries = [
+        { name: 'manifest.json', content: Buffer.from(JSON.stringify(manifest)) },
+        { name: 'files/doc_1-a.txt', content: Buffer.from('hello world') },
+        { name: 'files/doc_2-b.bin', content: Buffer.from([0, 1, 2, 3, 255]) },
+      ];
+
+      const chunks: Buffer[] = [];
+      await pipeline(
+        Readable.from(entries, { objectMode: true }),
+        createTarPackTransform(),
+        createGzip(),
+        new Writable({
+          write(chunk, _encoding, callback) {
+            chunks.push(Buffer.from(chunk));
+            callback();
+          },
+        }),
+      );
+
+      // Decode with the existing buffer unpacker — if the streamed tar bytes
+      // diverge from packTar's layout at all, this round-trip fails.
+      const unpacked = await service.unpack({ archive: Buffer.concat(chunks) });
+      expect(unpacked.manifest).toEqual(manifest);
+      expect(unpacked.files.get('doc_1-a.txt')!.toString()).toBe('hello world');
+      expect([...unpacked.files.get('doc_2-b.bin')!]).toEqual([0, 1, 2, 3, 255]);
     });
   });
 

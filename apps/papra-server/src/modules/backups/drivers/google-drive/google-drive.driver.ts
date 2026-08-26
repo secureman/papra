@@ -124,8 +124,10 @@ export const googleDriveBackupDriverFactory = defineBackupDriver(({ config }) =>
     },
 
     // Resumable upload: start a session, then PUT the bytes. Handles backups
-    // larger than the 5MB multipart-upload ceiling.
-    async uploadFile({ credentials, folderRef, fileName, mimeType, content, onProgress }) {
+    // larger than the 5MB multipart-upload ceiling. The body may be an
+    // in-memory Buffer or a stream (spooled envelope read from disk) — either
+    // way it's sent progressively so peak memory stays flat.
+    async uploadFile({ credentials, folderRef, fileName, mimeType, content, contentLength, onProgress }) {
       const refreshToken = credentials.refreshToken!;
       const accessToken = await getAccessToken({ refreshToken });
 
@@ -144,54 +146,76 @@ export const googleDriveBackupDriverFactory = defineBackupDriver(({ config }) =>
         throw createBackupDriverApiError();
       }
 
-      // Stream the body in chunks (rather than one opaque Buffer) so
-      // onProgress fires as undici pulls each slice — same trick as the
-      // WebDAV driver. Node's fetch (undici) requires `duplex: 'half'` for a
-      // streamed request body; when nobody listens for progress we pass the
-      // Buffer directly and skip that complexity.
+      const totalBytes = contentLength ?? (content instanceof Buffer ? content.length : undefined);
+      if (totalBytes === undefined) {
+        throw new Error('Streamed uploads require an explicit contentLength.');
+      }
+
+      // Stream the body rather than relying on chunked transfer-encoding:
+      // Content-Length is set explicitly — we always know the full size
+      // upfront (Buffer length or spool file stat), and a declared length lets
+      // Google's resumable-upload backend do one contiguous transfer instead
+      // of negotiating small internal writes whose per-write round-trip cost
+      // is the difference between "slow" and "as fast as the connection
+      // allows" on high-latency links.
       //
-      // Content-Length is set explicitly even for the streamed body: we
-      // already know the full size (`content` is a complete in-memory
-      // Buffer), so there's no reason to make undici fall back to chunked
-      // Transfer-Encoding. Uploading without a declared length forces
-      // Google's resumable-upload backend to treat it as an unknown-size
-      // stream, which negotiates in smaller internal writes instead of one
-      // contiguous transfer — on a high-latency link that per-write
-      // round-trip cost is the difference between "slow" and "as fast as
-      // the connection allows".
-      let uploadInit: RequestInit = {
+      // Progress is reported as undici pulls each slice: for a Buffer we wrap
+      // it in a pull-based ReadableStream with 256 KiB slices; for a stream
+      // body we count bytes through a passthrough TransformStream.
+      let uploadBody: ReadableStream<Uint8Array> | Buffer;
+      let uploadedBytes = 0;
+      const duplex = {} as { duplex?: 'half' };
+      if (content instanceof Buffer) {
+        uploadBody = content;
+        if (onProgress) {
+          const CHUNK_SIZE = 256 * 1024;
+          let offset = 0;
+          uploadBody = new ReadableStream<Uint8Array>({
+            pull(controller) {
+              if (offset >= content.length) {
+                controller.close();
+                return;
+              }
+              const end = Math.min(offset + CHUNK_SIZE, content.length);
+              controller.enqueue(content.subarray(offset, end));
+              offset = end;
+              onProgress({ uploadedBytes: offset });
+            },
+          });
+          duplex.duplex = 'half';
+        }
+      } else {
+        // `content` is the raw spooled-envelope stream. TS doesn't narrow a
+        // `Buffer | ReadableStream` union through `instanceof` here, so alias
+        // it to its web-stream type explicitly.
+        const source = content as ReadableStream<Uint8Array>;
+        uploadBody = onProgress
+          ? source.pipeThrough(
+              new TransformStream<Uint8Array, Uint8Array>(
+                {
+                  transform(chunk, controller) {
+                    controller.enqueue(chunk);
+                    uploadedBytes += chunk.byteLength;
+                    onProgress({ uploadedBytes });
+                  },
+                },
+                { highWaterMark: 4 * 1024 * 1024 },
+              ),
+            )
+          : source;
+        duplex.duplex = 'half';
+      }
+
+      const uploadResponse = await fetch(sessionUri, {
         method: 'PUT',
         headers: {
           'Content-Type': mimeType || GOOGLE_DRIVE_BACKUP_FILE_MIME_TYPE,
-          'Content-Length': String(content.length),
+          'Content-Length': String(totalBytes),
           'Authorization': `Bearer ${accessToken}`,
         },
-        body: content,
-      };
-      if (onProgress) {
-        const CHUNK_SIZE = 256 * 1024;
-        let offset = 0;
-        const bodyStream = new ReadableStream<Uint8Array>({
-          pull(controller) {
-            if (offset >= content.length) {
-              controller.close();
-              return;
-            }
-            const end = Math.min(offset + CHUNK_SIZE, content.length);
-            controller.enqueue(content.subarray(offset, end));
-            offset = end;
-            onProgress({ uploadedBytes: offset });
-          },
-        });
-        uploadInit = {
-          ...uploadInit,
-          body: bodyStream,
-          // `duplex` isn't in the standard RequestInit typings.
-          duplex: 'half',
-        } as RequestInit;
-      }
-
-      const uploadResponse = await fetch(sessionUri, uploadInit);
+        body: uploadBody,
+        ...duplex,
+      } as RequestInit);
       if (!uploadResponse.ok) {
         const body = await uploadResponse.text();
         logger.error({ status: uploadResponse.status, body }, 'Google Drive upload failed');

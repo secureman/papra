@@ -12,19 +12,21 @@ describe('local delivery service', () => {
 
   const envelopeArgs = {
     runId: 'bkrun_1',
-    envelope: Buffer.from('backup-bytes'),
+    filePath: '/tmp/papra-backup-envelope-test.tmp',
+    size: 13,
     fileName: 'papra-backup.papra-backup',
     organizationId: 'org_1',
     onExpire: () => {},
   };
 
   describe('holdForDownload / takeReadyDownload', () => {
-    test('delivers the envelope once, then nothing (one-shot claim)', () => {
+    test('delivers the spool file once, then nothing (one-shot claim)', () => {
       const service = createLocalDeliveryService();
       service.holdForDownload({ ...envelopeArgs, onExpire: vi.fn() });
 
       const claimed = service.takeReadyDownload({ runId: 'bkrun_1', organizationId: 'org_1' });
-      expect(claimed?.envelope.toString()).toBe('backup-bytes');
+      expect(claimed?.filePath).toBe('/tmp/papra-backup-envelope-test.tmp');
+      expect(claimed?.size).toBe(13);
       expect(claimed?.fileName).toBe('papra-backup.papra-backup');
 
       // Second tab / retry can't double-download.

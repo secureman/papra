@@ -1,5 +1,8 @@
 import type { Config } from '../config/config.types';
 import { describe, expect, test } from 'vitest';
+import { Readable, Writable } from 'node:stream';
+import { pipeline } from 'node:stream/promises';
+import { encrypt } from '../shared/crypto/encryption';
 import {
   createBackupEncryptionService,
   packBackupEnvelope,
@@ -54,6 +57,45 @@ describe('backup encryption service', () => {
       });
 
       expect(decrypted.toString('utf8')).toBe('archive bytes here');
+    });
+
+    test('streamed output is decryptable by the buffer decrypt path', async () => {
+      // The spooled-envelope path encrypts via createPayloadEncryptStream; its
+      // output MUST be byte-compatible with encryptPayload's layout so the
+      // existing decryptPayload() (used everywhere) can read it back.
+      const service = createService();
+      const key = service.generateBackupKey();
+      // Large enough to span multiple GCM/AES blocks.
+      const payload = Buffer.alloc(1024 * 1024 + 137, 0x5a);
+
+      const chunks: Buffer[] = [];
+      await pipeline(
+        Readable.from([payload]),
+        service.createPayloadEncryptStream({ key }),
+        new Writable({
+          write(chunk, _encoding, callback) {
+            chunks.push(Buffer.from(chunk));
+            callback();
+          },
+        }),
+      );
+
+      const decrypted = service.decryptPayload({ encryptedPayload: Buffer.concat(chunks), key });
+      expect(decrypted.equals(payload)).toBe(true);
+    });
+
+    test('decrypts legacy [iv][tag][ciphertext] payloads', () => {
+      // Older (non-streaming) backups encrypted the payload via the shared
+      // encrypt() helper, which produces [iv][tag][ciphertext]. decryptPayload
+      // must still read those back after the format move to tag-last.
+      const service = createService();
+      const key = service.generateBackupKey();
+      const payload = Buffer.from('legacy archive bytes');
+
+      const legacy = encrypt({ key, value: payload });
+      const decrypted = service.decryptPayload({ encryptedPayload: legacy, key });
+
+      expect(decrypted.equals(payload)).toBe(true);
     });
   });
 

@@ -1,6 +1,6 @@
 import { Buffer } from 'node:buffer';
 import { createHash } from 'node:crypto';
-import { Readable } from 'node:stream';
+import { Readable, Transform } from 'node:stream';
 import { createGzip, createGunzip } from 'node:zlib';
 import { isNil } from '../shared/utils';
 
@@ -199,6 +199,45 @@ function unpackTar(buffer: Buffer): TarEntry[] {
     offset += padToBlock(content).length;
   }
   return entries;
+}
+
+// Streaming twin of packTar(): accepts entries one at a time (object mode) and
+// emits the exact same ustar bytes, ending with the two zero blocks on flush.
+// Used by the envelope builder so a backup never holds more than ONE document
+// in memory at a time, no matter how big the organization is — packTar() needs
+// every entry resident simultaneously.
+//
+// Important: only the WRITABLE side is object-mode (entries in). The readable
+// side must stay byte-oriented because this transform's output (headers,
+// padded contents, end-of-archive blocks) is a real ustar byte stream destined
+// for gzip → encryption → disk. Using `objectMode: true` (both sides) would
+// make pipeline() choke when the Buffer output hits the byte-mode gzip sink.
+export function createTarPackTransform(): Transform {
+  return new Transform({
+    writableObjectMode: true,
+    transform(entry: TarEntry, _encoding, callback) {
+      try {
+        // Same validation as packTar's up-front loop, but per-entry as it
+        // streams through.
+        splitUstarPath(entry.name);
+        if (entry.content.length > MAX_ENTRY_SIZE_BYTES) {
+          throw new Error(
+            `Backup entry exceeds the ${MAX_ENTRY_SIZE_BYTES}-byte archive size limit: "${entry.name}"`,
+          );
+        }
+        this.push(buildEntryHeader({ name: entry.name, size: entry.content.length }));
+        this.push(padToBlock(entry.content));
+        callback();
+      } catch (error) {
+        callback(error instanceof Error ? error : new Error(String(error)));
+      }
+    },
+    flush(callback) {
+      // End-of-archive marker: two 512-byte zero blocks.
+      this.push(Buffer.alloc(BLOCK_SIZE * 2));
+      callback();
+    },
+  });
 }
 
 // High-level service. Handles gzip on top of tar so the final upload is a
