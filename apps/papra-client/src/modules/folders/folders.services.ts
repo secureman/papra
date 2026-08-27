@@ -18,9 +18,13 @@ export async function fetchOrganizationFolders({ organizationId }: { organizatio
 export async function fetchFolderContents({
   organizationId,
   folderId,
+  sortField,
+  sortOrder,
 }: {
   organizationId: string;
   folderId?: string | null;
+  sortField?: string | null;
+  sortOrder?: string | null;
 }) {
   const { folders, documents } = await apiClient<{
     folders: AsDto<Folder>[];
@@ -28,7 +32,11 @@ export async function fetchFolderContents({
   }>({
     path: `/api/organizations/${organizationId}/folders/contents`,
     method: 'GET',
-    query: folderId ? { folderId } : undefined,
+    query: {
+      ...(folderId ? { folderId } : {}),
+      ...(sortField ? { sortField } : {}),
+      ...(sortOrder ? { sortOrder } : {}),
+    },
   });
 
   return {

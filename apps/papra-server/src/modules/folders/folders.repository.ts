@@ -1,10 +1,15 @@
 import type { Database } from '../app/database/database.types';
-import { and, count, eq, getTableColumns, inArray, isNull, sql } from 'drizzle-orm';
+import { and, asc, count, desc, eq, getTableColumns, inArray, isNull, sql } from 'drizzle-orm';
 import { injectArguments, safely } from '@corentinth/chisels';
 import { documentsTable } from '../documents/documents.table';
 import { isUniqueConstraintError } from '../shared/db/constraints.models';
 import { omitUndefined } from '../shared/objects';
 import { isDefined } from '../shared/utils';
+import {
+  DEFAULT_FOLDER_CONTENTS_SORT_FIELD,
+  DEFAULT_FOLDER_CONTENTS_SORT_ORDER,
+} from './folders.constants';
+import type { FolderContentsSortField, FolderContentsSortOrder } from './folders.constants';
 import { createFolderAlreadyExistsError, createFolderNotFoundError } from './folders.errors';
 import { foldersTable } from './folders.table';
 
@@ -188,16 +193,37 @@ async function getChildFolders({
 }
 
 // Direct contents of a folder (subfolders + non-deleted documents), for a
-// Google-Drive-style "browse this folder" view.
+// Google-Drive-style "browse this folder" view. Documents are ordered by the
+// requested sort field/order; name ordering is case-insensitive.
+function getDocumentSortExpression({ sortField }: { sortField: FolderContentsSortField }) {
+  switch (sortField) {
+    case 'name':
+      // Case-insensitive so uppercase names don't clump at one end of the list.
+      return sql`lower(${documentsTable.name})`;
+    case 'documentDate':
+      return documentsTable.documentDate;
+    case 'createdAt':
+      return documentsTable.createdAt;
+    case 'updatedAt':
+      return documentsTable.updatedAt;
+  }
+}
+
 async function getFolderContents({
   organizationId,
   folderId,
+  sortField = DEFAULT_FOLDER_CONTENTS_SORT_FIELD,
+  sortOrder = DEFAULT_FOLDER_CONTENTS_SORT_ORDER,
   db,
 }: {
   organizationId: string;
   folderId: string | null;
+  sortField?: FolderContentsSortField;
+  sortOrder?: FolderContentsSortOrder;
   db: Database;
 }) {
+  const sortExpression = getDocumentSortExpression({ sortField });
+
   const [{ folders }, documents] = await Promise.all([
     getChildFolders({ organizationId, parentId: folderId, db }),
     db
@@ -212,7 +238,11 @@ async function getFolderContents({
             : eq(documentsTable.folderId, folderId),
         ),
       )
-      .orderBy(documentsTable.name),
+      // Secondary id ordering keeps results deterministic when rows share the same sort value.
+      .orderBy(
+        sortOrder === 'desc' ? desc(sortExpression) : asc(sortExpression),
+        asc(documentsTable.id),
+      ),
   ]);
 
   return { folders, documents };

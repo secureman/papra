@@ -1,12 +1,18 @@
 import type { Component } from 'solid-js';
 import type { Document } from '@/modules/documents/documents.types';
 import { useMutation, useQuery } from '@tanstack/solid-query';
-import { createMemo } from 'solid-js';
+import { createEffect, createMemo, createSignal, on, Show } from 'solid-js';
 import { useI18n } from '@/modules/i18n/i18n.provider';
 import { useI18nApiErrors } from '@/modules/shared/http/composables/i18n-api-errors';
 import { queryClient } from '@/modules/shared/query/query-client';
 import { Button } from '@/modules/ui/components/button';
-import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/modules/ui/components/dialog';
+import {
+  Dialog,
+  DialogContent,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from '@/modules/ui/components/dialog';
 import {
   Select,
   SelectContent,
@@ -31,6 +37,11 @@ export const MoveDocumentDialog: Component<{
   const { t } = useI18n();
   const { getErrorMessage } = useI18nApiErrors({ t });
 
+  // Destination folder selection. Initialized with the document's current
+  // location when the dialog opens; the move is only ever committed through
+  // the explicit "Move" button, never directly from the select onChange.
+  const [getFolderId, setFolderId] = createSignal<string | null | undefined>(undefined);
+
   const foldersQuery = useQuery(() => ({
     queryKey: ['organizations', props.document.organizationId, 'folders'],
     queryFn: async () =>
@@ -49,6 +60,17 @@ export const MoveDocumentDialog: Component<{
       })),
     ];
   });
+
+  // Reset the selection to the document's current folder each time the dialog opens,
+  // so reopening after a cancel can never confirm a stale selection.
+  createEffect(
+    on(
+      () => props.open,
+      () => setFolderId(props.document.folderId ?? null),
+    ),
+  );
+
+  const getCurrentFolderId = () => props.document.folderId ?? null;
 
   const moveMutation = useMutation(() => ({
     mutationFn: async (folderId: string | null) =>
@@ -74,6 +96,13 @@ export const MoveDocumentDialog: Component<{
     },
   }));
 
+  function handleConfirm() {
+    const folderId = getFolderId();
+    if (folderId === undefined) return;
+
+    moveMutation.mutate(folderId);
+  }
+
   return (
     <Dialog open={props.open} onOpenChange={props.onOpenChange}>
       <DialogContent>
@@ -81,39 +110,48 @@ export const MoveDocumentDialog: Component<{
           <DialogTitle>{t('folders.move.title')}</DialogTitle>
         </DialogHeader>
 
-        <Select<FolderOption>
-          options={getOptions()}
-          optionValue="id"
-          optionTextValue="label"
-          value={getOptions().find((option) => option.id === (props.document.folderId ?? null))}
-          onChange={(value) => {
-            if (!value) {
-              return;
-            }
-            moveMutation.mutate(value.id);
-          }}
-          itemComponent={(itemProps) => (
-            <SelectItem class="cursor-pointer" item={itemProps.item}>
-              {itemProps.item.rawValue.label}
-            </SelectItem>
-          )}
-        >
-          <SelectTrigger>
-            <SelectValue<FolderOption>>{(state) => state.selectedOption()?.label}</SelectValue>
-          </SelectTrigger>
-          <SelectContent />
-        </Select>
-
-        <div class="flex justify-end mt-6">
-          <Button
-            type="button"
-            variant="outline"
-            onClick={() => props.onOpenChange(false)}
-            disabled={moveMutation.isPending}
+        <Show when={props.open}>
+          <Select<FolderOption>
+            options={getOptions()}
+            optionValue="id"
+            optionTextValue="label"
+            value={getOptions().find((option) => option.id === getFolderId())}
+            onChange={(value) => setFolderId(value?.id ?? null)}
+            itemComponent={(itemProps) => (
+              <SelectItem class="cursor-pointer" item={itemProps.item}>
+                {itemProps.item.rawValue.label}
+              </SelectItem>
+            )}
           >
-            {t('folders.delete.confirm.cancel-button')}
-          </Button>
-        </div>
+            <SelectTrigger>
+              <SelectValue<FolderOption>>
+                {(state) => state.selectedOption()?.label ?? t('folders.move.select-placeholder')}
+              </SelectValue>
+            </SelectTrigger>
+            <SelectContent />
+          </Select>
+        </Show>
+
+        <DialogFooter>
+          <div class="flex gap-2 justify-end flex-col-reverse sm:flex-row">
+            <Button
+              type="button"
+              variant="secondary"
+              onClick={() => props.onOpenChange(false)}
+              disabled={moveMutation.isPending}
+            >
+              {t('folders.delete.confirm.cancel-button')}
+            </Button>
+            <Button
+              type="button"
+              onClick={handleConfirm}
+              isLoading={moveMutation.isPending}
+              disabled={moveMutation.isPending || getFolderId() === getCurrentFolderId()}
+            >
+              {t('folders.move.confirm-button')}
+            </Button>
+          </div>
+        </DialogFooter>
       </DialogContent>
     </Dialog>
   );

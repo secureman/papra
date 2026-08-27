@@ -815,6 +815,7 @@ export const translations = {
   'folders.delete.success': 'Folder deleted',
   'folders.move-to-folder': 'Move to folder',
   'folders.move.title': 'Move document',
+  'folders.move.confirm-button': 'Move',
   'folders.move.select-placeholder': 'Select a destination folder',
   'folders.move.success': 'Document moved',
   'folders.subfolders.actions.rename': 'Rename',

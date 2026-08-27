@@ -1,6 +1,6 @@
 import type { DialogTriggerProps } from '@kobalte/core/dialog';
-import type { RowSelectionState } from '@tanstack/solid-table';
-import type { Component } from 'solid-js';
+import type { RowSelectionState, SortingState } from '@tanstack/solid-table';
+import type { Component, Setter } from 'solid-js';
 import { A, useNavigate, useParams } from '@solidjs/router';
 import { useMutation, useQuery } from '@tanstack/solid-query';
 import { createMemo, createSignal, For, Show } from 'solid-js';
@@ -20,6 +20,8 @@ import { invalidateOrganizationDocumentsQuery } from '@/modules/documents/docume
 import { useI18n } from '@/modules/i18n/i18n.provider';
 import { useConfirmModal } from '@/modules/shared/confirm';
 import { useI18nApiErrors } from '@/modules/shared/http/composables/i18n-api-errors';
+import { createParamSynchronizedSignal } from '@/modules/shared/signals/params';
+import { resolveSetterValue } from '@/modules/shared/signals/setters';
 import { queryClient } from '@/modules/shared/query/query-client';
 import { Button } from '@/modules/ui/components/button';
 import { Checkbox, CheckboxControl, CheckboxLabel } from '@/modules/ui/components/checkbox';
@@ -28,6 +30,13 @@ import { createToast } from '@/modules/ui/components/sonner';
 import { buildFolderPath } from '../composables/folder-tree';
 import { CreateFolderDialog, RenameFolderDialog } from '../components/folder-dialogs.component';
 import { deleteFolder, fetchFolderContents, fetchOrganizationFolders } from '../folders.services';
+import {
+  DEFAULT_FOLDER_CONTENTS_SORT_FIELD,
+  DEFAULT_FOLDER_CONTENTS_SORT_ORDER,
+  FOLDER_CONTENTS_SORT_FIELDS,
+  FOLDER_CONTENTS_SORT_ORDERS,
+} from '../folders.constants';
+import type { FolderContentsSortField, FolderContentsSortOrder } from '../folders.constants';
 import type { Folder } from '../folders.types';
 import {
   DropdownMenu,
@@ -149,10 +158,58 @@ export const FolderPage: Component = () => {
 
   const currentFolderId = () => params.folderId ?? null;
 
+  // File sorting state synchronized with URL search params (?sortField=name&sortOrder=asc),
+  // same pattern as the main documents page. Column headers of the table are clickable
+  // to toggle sorting; the selection is passed through to the folder contents API.
+  const [getSortField, setSortField] = createParamSynchronizedSignal<FolderContentsSortField>({
+    paramKey: 'sortField',
+    defaultValue: DEFAULT_FOLDER_CONTENTS_SORT_FIELD,
+    deserialize: (value) =>
+      FOLDER_CONTENTS_SORT_FIELDS.includes(value as FolderContentsSortField)
+        ? (value as FolderContentsSortField)
+        : DEFAULT_FOLDER_CONTENTS_SORT_FIELD,
+  });
+  const [getSortOrder, setSortOrder] = createParamSynchronizedSignal<FolderContentsSortOrder>({
+    paramKey: 'sortOrder',
+    defaultValue: DEFAULT_FOLDER_CONTENTS_SORT_ORDER,
+    deserialize: (value) =>
+      FOLDER_CONTENTS_SORT_ORDERS.includes(value as FolderContentsSortOrder)
+        ? (value as FolderContentsSortOrder)
+        : DEFAULT_FOLDER_CONTENTS_SORT_ORDER,
+  });
+
+  const getSorting = (): SortingState => [{ id: getSortField(), desc: getSortOrder() === 'desc' }];
+
+  const setSorting: Setter<SortingState> = (valueOrUpdater) => {
+    const next = resolveSetterValue(valueOrUpdater, getSorting());
+    const first = next[0];
+    if (!first) {
+      setSortField(DEFAULT_FOLDER_CONTENTS_SORT_FIELD);
+      setSortOrder(DEFAULT_FOLDER_CONTENTS_SORT_ORDER);
+      return next;
+    }
+    setSortField(first.id as FolderContentsSortField);
+    setSortOrder(first.desc ? 'desc' : 'asc');
+    return next;
+  };
+
   const contentsQuery = useQuery(() => ({
-    queryKey: ['organizations', params.organizationId, 'folders', 'contents', currentFolderId()],
+    queryKey: [
+      'organizations',
+      params.organizationId,
+      'folders',
+      'contents',
+      currentFolderId(),
+      getSortField(),
+      getSortOrder(),
+    ],
     queryFn: async () =>
-      fetchFolderContents({ organizationId: params.organizationId, folderId: currentFolderId() }),
+      fetchFolderContents({
+        organizationId: params.organizationId,
+        folderId: currentFolderId(),
+        sortField: getSortField(),
+        sortOrder: getSortOrder(),
+      }),
   }));
 
   const [getDocumentRowSelection, setDocumentRowSelection] = createSignal<RowSelectionState>({});
@@ -580,7 +637,14 @@ export const FolderPage: Component = () => {
                 getRowSelection={getDocumentRowSelection}
                 setRowSelection={setDocumentRowSelection}
                 showPagination={false}
-                extraColumns={[tagsColumn, createdAtColumn, standardActionsColumn]}
+                getSorting={getSorting}
+                setSorting={setSorting}
+                extraColumns={[
+                  // Tags cannot be sorted by this endpoint, disable header sorting for them.
+                  { ...tagsColumn, enableSorting: false },
+                  createdAtColumn,
+                  standardActionsColumn,
+                ]}
               />
 
               <DocumentsBatchMoveDialog

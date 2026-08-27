@@ -1,5 +1,11 @@
 import * as v from 'valibot';
 import { createRegexSchema } from '../shared/schemas/string.schemas';
+import {
+  DEFAULT_FOLDER_CONTENTS_SORT_FIELD,
+  DEFAULT_FOLDER_CONTENTS_SORT_ORDER,
+  FOLDER_CONTENTS_SORT_FIELDS,
+  FOLDER_CONTENTS_SORT_ORDERS,
+} from './folders.constants';
 import { folderIdRegex, MAX_FOLDER_NAME_LENGTH } from './folders.constants';
 
 export const folderIdSchema = createRegexSchema(folderIdRegex);
@@ -26,3 +32,15 @@ export const updateFolderBodySchema = v.pipe(
     "At least one of 'name' or 'parentId' must be provided",
   ),
 );
+
+export const folderContentsQuerySchema = v.strictObject({
+  folderId: v.optional(folderIdSchema),
+  sortField: v.optional(
+    v.picklist(FOLDER_CONTENTS_SORT_FIELDS),
+    DEFAULT_FOLDER_CONTENTS_SORT_FIELD,
+  ),
+  sortOrder: v.optional(
+    v.picklist(FOLDER_CONTENTS_SORT_ORDERS),
+    DEFAULT_FOLDER_CONTENTS_SORT_ORDER,
+  ),
+});

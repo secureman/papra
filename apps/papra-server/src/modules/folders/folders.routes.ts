@@ -13,7 +13,12 @@ import { createTagsRepository } from '../tags/tags.repository';
 import { validateJsonBody, validateParams, validateQuery } from '../shared/validation/validation';
 import { createFolderNotFoundError } from './folders.errors';
 import { createFoldersRepository } from './folders.repository';
-import { createFolderBodySchema, folderIdSchema, updateFolderBodySchema } from './folders.schemas';
+import {
+  createFolderBodySchema,
+  folderContentsQuerySchema,
+  folderIdSchema,
+  updateFolderBodySchema,
+} from './folders.schemas';
 import { createFolder, deleteFolder, moveOrRenameFolder } from './folders.usecases';
 
 export function registerFoldersRoutes(context: RouteDefinitionContext) {
@@ -83,11 +88,11 @@ function setupGetFolderContentsRoute({ app, db }: RouteDefinitionContext) {
     '/api/organizations/:organizationId/folders/contents',
     requireAuthentication({ apiKeyPermissions: [API_KEY_PERMISSIONS.FOLDERS.READ] }),
     validateParams(v.strictObject({ organizationId: organizationIdSchema })),
-    validateQuery(v.strictObject({ folderId: v.optional(folderIdSchema) })),
+    validateQuery(folderContentsQuerySchema),
     async (context) => {
       const { userId } = getUser({ context });
       const { organizationId } = context.req.valid('param');
-      const { folderId } = context.req.valid('query');
+      const { folderId, sortField, sortOrder } = context.req.valid('query');
 
       const foldersRepository = createFoldersRepository({ db });
       const organizationsRepository = createOrganizationsRepository({ db });
@@ -106,6 +111,8 @@ function setupGetFolderContentsRoute({ app, db }: RouteDefinitionContext) {
       const { folders, documents } = await foldersRepository.getFolderContents({
         organizationId,
         folderId: folderId ?? null,
+        sortField,
+        sortOrder,
       });
 
       const { enrichedDocuments } = await enrichAndFormatDocumentsForApi({
