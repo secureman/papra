@@ -591,12 +591,25 @@ function setupDownloadBackupCopyRoute({
       });
 
       // The envelope was streamed to a spool file (not RAM) to keep peak
-      // memory flat. Stream it straight to the client, then delete the spool
-      // file once the response has been fully handed off.
+      // memory flat. Streaming into the HTTP response can't be awaited here,
+      // so the spool file is deleted on EVERY terminal event instead of only
+      // on success: 'end' (clean finish), 'error' (read failure) — and
+      // crucially 'close', which fires when the client cancels/breaks the
+      // download mid-stream and the destroyed response body never reaches
+      // 'end'. Without it, every interrupted download leaked a full-size
+      // envelope in the temp dir.
       const fileStream = createReadStream(spoolPath);
-      const cleanup = () => void deleteEnvelopeSpoolFile({ path: spoolPath });
+      let cleanedUp = false;
+      const cleanup = () => {
+        if (cleanedUp) {
+          return;
+        }
+        cleanedUp = true;
+        void deleteEnvelopeSpoolFile({ path: spoolPath });
+      };
       fileStream.once('end', cleanup);
       fileStream.once('error', cleanup);
+      fileStream.once('close', cleanup);
 
       return context.body(Readable.toWeb(fileStream), 200, {
         'Content-Type': 'application/octet-stream',
@@ -641,12 +654,22 @@ function setupDownloadReadyRunRoute({ app, config, db }: RouteDefinitionContext)
       });
 
       // Ownership of the spool file has transferred to this route — stream it
-      // to the client, then delete it (on success or failure) so spool files
-      // never accumulate in the temp dir.
+      // to the client, then delete it so spool files never accumulate in the
+      // temp dir. Same rationale as setupDownloadBackupCopyRoute above: the
+      // cleanup listens to 'close' too, because an aborted/interrupted
+      // download destroys the stream without ever emitting 'end'.
       const fileStream = createReadStream(spoolPath);
-      const cleanup = () => void deleteEnvelopeSpoolFile({ path: spoolPath });
+      let cleanedUp = false;
+      const cleanup = () => {
+        if (cleanedUp) {
+          return;
+        }
+        cleanedUp = true;
+        void deleteEnvelopeSpoolFile({ path: spoolPath });
+      };
       fileStream.once('end', cleanup);
       fileStream.once('error', cleanup);
+      fileStream.once('close', cleanup);
 
       return context.body(Readable.toWeb(fileStream), 200, {
         'Content-Type': 'application/octet-stream',

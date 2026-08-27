@@ -49,10 +49,7 @@ import {
   createBackupsNotConfiguredError,
 } from './backups.errors';
 import type { BackupDriverName } from './drivers/drivers.registry';
-import {
-  createEnvelopeSpoolPath,
-  deleteEnvelopeSpoolFile,
-} from './backups.envelope-spool';
+import { createEnvelopeSpoolPath, deleteEnvelopeSpoolFile } from './backups.envelope-spool';
 import { createTarPackTransform } from './backups.packager.service';
 
 const logger = createLogger({ namespace: 'backups:usecases' });
@@ -265,7 +262,8 @@ export async function reapOrphanedBackupRunsAndJobsUsecase({
   logger?: Logger;
 }): Promise<void> {
   const { markedRunsCount, markedJobsCount } = await repository.reapAllOrphanedRunsAndJobs({
-    errorMessage: 'Backup was interrupted by a server restart and could not be resumed. Please try again.',
+    errorMessage:
+      'Backup was interrupted by a server restart and could not be resumed. Please try again.',
     restoreJobErrorMessage:
       'Restore was interrupted by a server restart and could not be resumed. Please try again.',
   });
@@ -472,8 +470,9 @@ async function spoolEncryptedBackupEnvelope({
     processedBytes: number;
   }) => void | Promise<void>;
 }): Promise<{ spoolPath: string; size: number; documentsCount: number }> {
-  const { documents } =
-    await documentsRepository.getAllOrganizationUndeletedDocumentsForBackup({ organizationId });
+  const { documents } = await documentsRepository.getAllOrganizationUndeletedDocumentsForBackup({
+    organizationId,
+  });
 
   const totalRawBytes = documents.reduce((sum, d) => sum + (d.originalSize ?? 0), 0);
   await onStart?.({ documentsCount: documents.length, totalRawBytes });
@@ -528,7 +527,10 @@ async function spoolEncryptedBackupEnvelope({
           };
           processedBytes += content.length;
         } catch (error) {
-          logger.error({ error, documentId: doc.id }, 'Failed to fetch document for backup; skipping');
+          logger.error(
+            { error, documentId: doc.id },
+            'Failed to fetch document for backup; skipping',
+          );
           // Still count the (unread) doc's expected size so the bar doesn't stall
           // short of 100% just because one document failed to fetch.
           processedBytes += doc.originalSize ?? 0;
@@ -664,6 +666,7 @@ async function runBackupPipeline({
   // rejection, which the global handler treats as fatal and shuts the whole
   // server down. Every fallible statement therefore lives inside the try so
   // failures land in run history instead of killing the process.
+  let ownedSpoolPath: string | undefined;
   try {
     const { destination } = await repository.getDestinationById({ destinationId, organizationId });
     if (!destination) {
@@ -677,9 +680,9 @@ async function runBackupPipeline({
       dek = encryption.unwrapWithKek({ wrapped: destination.wrappedBackupKey });
     } catch (unwrapError) {
       throw new Error(
-        `Failed to decrypt the destination's stored credentials or backup key. `
-        + `The server's BACKUPS_KEK likely changed since this destination was created `
-        + `— delete and re-create the destination. [${(unwrapError as Error)?.message ?? 'unknown error'}]`,
+        `Failed to decrypt the destination's stored credentials or backup key. ` +
+          `The server's BACKUPS_KEK likely changed since this destination was created ` +
+          `— delete and re-create the destination. [${(unwrapError as Error)?.message ?? 'unknown error'}]`,
       );
     }
 
@@ -687,7 +690,7 @@ async function runBackupPipeline({
     try {
       settings = JSON.parse(destination.settingsJson) as Record<string, unknown>;
     } catch {
-      throw new Error('The destination\'s stored settings are corrupted (invalid JSON).');
+      throw new Error("The destination's stored settings are corrupted (invalid JSON).");
     }
 
     const driver = services.getDriver(destination.driver);
@@ -705,6 +708,13 @@ async function runBackupPipeline({
       onStart: progress.onPackagingStart,
       onProgress: progress.onPackagingProgress,
     });
+
+    // This process now OWNS the spool file. Track it so the catch below can
+    // free it if anything between packaging and the upload's own finally fails
+    // (status writes, ensureRemoteFolder, ...) — otherwise a fully-written
+    // envelope gets stranded in the temp dir and repeats of that failure
+    // eventually fill the disk up to ENOSPC.
+    ownedSpoolPath = spoolPath;
 
     const fileName = `papra-backup-${organizationId.slice(-6)}-${new Date().toISOString().replace(/[:.]/g, '-')}${BACKUP_FILE_EXTENSION}`;
 
@@ -743,6 +753,9 @@ async function runBackupPipeline({
             });
         },
       });
+      // Ownership of the file just moved to the delivery service (expiry /
+      // discard / one-shot claim all delete it) — release our claim.
+      ownedSpoolPath = undefined;
       await repository.updateRunStatus({
         runId,
         status: 'ready_for_download',
@@ -787,6 +800,7 @@ async function runBackupPipeline({
       // Free the spool file whether the upload succeeded or died mid-flight —
       // the data has been handed to the driver by now.
       await deleteEnvelopeSpoolFile({ path: spoolPath });
+      ownedSpoolPath = undefined;
     }
 
     await repository.updateRunStatus({
@@ -801,11 +815,16 @@ async function runBackupPipeline({
     });
     await repository.updateDestination({ destinationId, fields: { lastRunAt: new Date() } });
 
-    logger.info(
-      { runId, destinationId, size, documentsCount },
-      'Backup run completed',
-    );
+    logger.info({ runId, destinationId, size, documentsCount }, 'Backup run completed');
   } catch (error) {
+    // Safety net for everything between "packaging finished" and the upload's
+    // own cleanup: status writes, ensureRemoteFolder network errors, etc.
+    // Without this a complete envelope is stranded in the temp dir every time
+    // that path fails.
+    if (ownedSpoolPath) {
+      void deleteEnvelopeSpoolFile({ path: ownedSpoolPath });
+      ownedSpoolPath = undefined;
+    }
     logger.error({ error, runId, destinationId }, 'Backup run failed');
     // The whole pipeline runs fire-and-forget (`void runBackupPipeline(...)`),
     // so a throwing status write here would escape as an unhandled rejection.

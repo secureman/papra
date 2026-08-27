@@ -11,6 +11,7 @@ import { createEventServices } from './modules/app/events/events.services';
 import { createGracefulShutdownService } from './modules/app/graceful-shutdown/graceful-shutdown.services';
 import { getProcessMode } from './modules/app/process.models';
 import { createServer } from './modules/app/server';
+import { cleanupOrphanedEnvelopeSpoolFiles } from './modules/backups/backups.envelope-spool';
 import { createBackupsRepository } from './modules/backups/backups.repository';
 import { reapOrphanedBackupRunsAndJobsUsecase } from './modules/backups/backups.usecases';
 import { parseConfig } from './modules/config/config';
@@ -95,12 +96,29 @@ async function buildServices({ config }: { config: Config }): Promise<GlobalDepe
   // accepting requests, since a run stuck at "uploading" also blocks a fresh
   // run from being created for that destination (see backups.usecases.ts).
   // Best-effort: a failure here shouldn't prevent the app from starting.
+  const appServerLogger = createLogger({ namespace: 'app-server' });
+
   try {
     await reapOrphanedBackupRunsAndJobsUsecase({ repository: createBackupsRepository({ db }) });
+
+    // Also sweep spool FILES orphaned by the same kind of unclean death.
+    // Envelope spool files are owned by the process that built them (the
+    // upload's finally, the delivery TTL, the download route all die with it),
+    // so right now — before any run can have started — every
+    // papra-backup-envelope-*.tmp in the temp dir is garbage. Without this
+    // sweep, enough crashed runs eventually fill the disk and every new backup
+    // fails mid-packaging with ENOSPC ("no space left on device").
+    const sweptSpoolFilesCount = await cleanupOrphanedEnvelopeSpoolFiles();
+    if (sweptSpoolFilesCount > 0) {
+      appServerLogger.info(
+        { sweptSpoolFilesCount },
+        'Deleted orphaned backup envelope spool files left behind before the last restart',
+      );
+    }
   } catch (error) {
-    createLogger({ namespace: 'app-server' }).error(
+    appServerLogger.error(
       { error },
-      'Failed to reap orphaned backup runs/restore jobs on startup',
+      'Failed to reap orphaned backup runs/restore jobs or sweep envelope spool files on startup',
     );
   }
 

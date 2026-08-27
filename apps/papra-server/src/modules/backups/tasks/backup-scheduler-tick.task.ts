@@ -1,7 +1,8 @@
 import type { GlobalDependencies } from '../../app/server.types';
 import { createDocumentsRepository } from '../../documents/documents.repository';
 import { createLogger } from '../../shared/logger/logger';
-import { SCHEDULER_TICK_CRON } from '../backups.constants';
+import { SCHEDULER_TICK_CRON, STALE_IN_PROGRESS_RUN_TIMEOUT_MS } from '../backups.constants';
+import { cleanupOrphanedEnvelopeSpoolFiles } from '../backups.envelope-spool';
 import { createBackupsRepository } from '../backups.repository';
 import { createBackupsServices } from '../backups.services';
 import { runDueScheduledBackupsUsecase } from '../backups.usecases';
@@ -38,6 +39,19 @@ export async function registerBackupSchedulerTickTask(deps: GlobalDependencies) 
 
       if (triggeredCount > 0) {
         logger.info({ triggeredCount }, 'Triggered scheduled backups');
+      }
+
+      // Safety valve against temp-dir leaks: the pipeline and download routes
+      // clean up their own spool files, but any unknown edge case that ever
+      // strands an envelope while the server keeps running gets freed here on
+      // the next tick instead of eating disk space forever. Only files idle
+      // longer than the stale-run timeout are touched, so live runs are never
+      // disturbed.
+      const sweptSpoolFilesCount = await cleanupOrphanedEnvelopeSpoolFiles({
+        maxAgeMs: STALE_IN_PROGRESS_RUN_TIMEOUT_MS,
+      });
+      if (sweptSpoolFilesCount > 0) {
+        logger.info({ sweptSpoolFilesCount }, 'Swept orphaned backup envelope spool files');
       }
     },
   });
