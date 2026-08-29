@@ -1,4 +1,6 @@
 import type { Config } from '../../../config/config.types';
+import { createWriteStream } from 'node:fs';
+import { stat } from 'node:fs/promises';
 import { createLogger } from '../../../shared/logger/logger';
 import { createBackupDriverApiError } from '../../backups.errors';
 import { defineBackupDriver } from '../drivers.models';
@@ -225,7 +227,7 @@ export const googleDriveBackupDriverFactory = defineBackupDriver(({ config }) =>
       return { remoteFileId: uploaded.id, remoteFileName: uploaded.name };
     },
 
-    async downloadFile({ credentials, remoteFileId, onProgress }) {
+    async downloadFile({ credentials, remoteFileId, destinationPath, onProgress }) {
       const refreshToken = credentials.refreshToken!;
       const url = `${GOOGLE_DRIVE_FILES_ENDPOINT}/${remoteFileId}?alt=media`;
       const response = await authorizedFetch({ refreshToken, url, init: { method: 'GET' } });
@@ -236,16 +238,23 @@ export const googleDriveBackupDriverFactory = defineBackupDriver(({ config }) =>
         return Number.isFinite(parsed) ? parsed : null;
       })();
 
+      const writeStream = createWriteStream(destinationPath);
+
       if (!response.body) {
         // Some fetch implementations/environments don't expose a streamable
         // body — fall back to buffering the whole thing at once. No progress
-        // in this case, but the download itself still works.
+        // in this case, but the download itself still works. Rare in
+        // practice (undici, Node's default fetch, always exposes a body).
         const arrayBuffer = await response.arrayBuffer();
-        return Buffer.from(arrayBuffer);
+        await new Promise<void>((resolvePromise, reject) => {
+          writeStream.on('error', reject);
+          writeStream.end(Buffer.from(arrayBuffer), () => resolvePromise());
+        });
+        const { size } = await stat(destinationPath);
+        return { size };
       }
 
       const reader = response.body.getReader();
-      const chunks: Uint8Array[] = [];
       let downloadedBytes = 0;
 
       // Per-chunk inactivity timeout rather than a total-duration one — a
@@ -266,12 +275,21 @@ export const googleDriveBackupDriverFactory = defineBackupDriver(({ config }) =>
           if (done) {
             break;
           }
-          chunks.push(value);
+          // Written straight to disk as it arrives instead of collected into
+          // an in-memory chunks array — a 700MB backup previously meant a
+          // 700MB chunks array PLUS a second 700MB Buffer.concat() copy held
+          // simultaneously, which is what OOM-killed constrained hosts
+          // (Termux/udocker) on large-org restores.
+          const canContinue = writeStream.write(Buffer.from(value));
+          if (!canContinue) {
+            await new Promise<void>((resolvePromise) => writeStream.once('drain', resolvePromise));
+          }
           downloadedBytes += value.byteLength;
           onProgress?.({ downloadedBytes, totalBytes });
         }
       } catch (error) {
         await reader.cancel().catch(() => {});
+        writeStream.destroy();
         logger.error(
           { url, downloadedBytes, totalBytes },
           'Google Drive download stalled or failed',
@@ -279,7 +297,13 @@ export const googleDriveBackupDriverFactory = defineBackupDriver(({ config }) =>
         throw error;
       }
 
-      return Buffer.concat(chunks);
+      await new Promise<void>((resolvePromise, reject) => {
+        writeStream.on('error', reject);
+        writeStream.end(() => resolvePromise());
+      });
+
+      const { size } = await stat(destinationPath);
+      return { size };
     },
 
     async deleteFile({ credentials, remoteFileId }) {

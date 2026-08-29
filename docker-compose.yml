@@ -34,6 +34,9 @@ services:
       # Optional: Server configuration
       - PORT=${PORT:-1221}
       - SERVER_HOSTNAME=0.0.0.0
+      # Serve the built client UI from the same server (papra's config default is false —
+      # without this the UI falls through to the API 404 handler: {"code":"api.not-found"})
+      - SERVER_SERVE_PUBLIC_DIR=true
 
       # Optional: Enable/disable features
       - AUTH_FIRST_USER_AS_ADMIN=${AUTH_FIRST_USER_AS_ADMIN:-true}

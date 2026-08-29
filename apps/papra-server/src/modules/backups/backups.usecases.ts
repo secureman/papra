@@ -9,9 +9,12 @@ import type { BackupsServices } from './backups.services';
 import type { BackupRunTrigger, BackupSchedule } from './backups.types';
 import { Readable as NodeReadable } from 'node:stream';
 import { createReadStream, createWriteStream } from 'node:fs';
-import { stat } from 'node:fs/promises';
+import { mkdir, readFile, stat, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { randomBytes } from 'node:crypto';
 import { pipeline } from 'node:stream/promises';
-import { createGzip } from 'node:zlib';
+import { createBrotliCompress } from 'node:zlib';
 import { createDocumentActivityRepository } from '../documents/document-activity/document-activity.repository';
 import { createDocumentCreationUsecase, restoreDocument } from '../documents/documents.usecases';
 import { createFoldersRepository } from '../folders/folders.repository';
@@ -37,6 +40,7 @@ import {
 } from './backups.constants';
 import {
   unpackBackupEnvelope,
+  readEnvelopeHeaderFromFile,
   unwrapCredentials,
   wrapCredentials,
 } from './backups.encryption.service';
@@ -50,7 +54,12 @@ import {
 } from './backups.errors';
 import type { BackupDriverName } from './drivers/drivers.registry';
 import { createEnvelopeSpoolPath, deleteEnvelopeSpoolFile } from './backups.envelope-spool';
-import { createTarPackTransform } from './backups.packager.service';
+import {
+  createTarPackTransform,
+  unpackStreamToDirectory,
+  removeExtractionDirectory,
+  BROTLI_OPTIONS,
+} from './backups.packager.service';
 
 const logger = createLogger({ namespace: 'backups:usecases' });
 
@@ -435,7 +444,7 @@ async function buildBackupManifest({
 // then the tarball, the gzip output and the encrypted payload on top — ~700 MB
 // of RSS that OOM-killed small self-hosted servers like a Termux/udocker box),
 // the envelope is STREAMED to a spool file on disk (see backups.envelope-spool.ts):
-// tar → gzip → encryption are piped with real backpressure, so at most ONE
+// tar → brotli → encryption are piped with real backpressure, so at most ONE
 // document is held in memory at a time regardless of library size.
 //
 // The caller OWNS the spool file: it must be uploaded / streamed to a client /
@@ -545,7 +554,7 @@ async function spoolEncryptedBackupEnvelope({
     await pipeline(
       documentsStream,
       createTarPackTransform(),
-      createGzip(),
+      createBrotliCompress(BROTLI_OPTIONS),
       encryption.createPayloadEncryptStream({ key: dek }),
       writeStream,
     );
@@ -926,7 +935,7 @@ async function restoreFromEnvelopeUsecase({
   documentsRepository,
   foldersRepository,
   organizationId,
-  envelope,
+  envelopePath,
   userId,
   onManifestReady,
   onProgress,
@@ -936,7 +945,15 @@ async function restoreFromEnvelopeUsecase({
   documentsRepository: DocumentsRepository;
   foldersRepository: FoldersRepository;
   organizationId: string;
-  envelope: Buffer;
+  // Path to the (already-downloaded/uploaded) envelope file on disk. Taking a
+  // path instead of a Buffer here is what lets the whole decrypt/decompress/
+  // untar chain below stream straight through to disk instead of buffering a
+  // (potentially many-hundred-MB) backup file three separate times over —
+  // once as ciphertext, once as decrypted-and-compressed, once as the
+  // decompressed tar — on top of a Map holding every document in the backup
+  // simultaneously. That combination is what OOM-killed restores of larger
+  // orgs on memory-constrained hosts (Termux/udocker).
+  envelopePath: string;
   userId?: string;
   // Fired once the manifest is unpacked and the real document count is known
   // (before the per-document loop starts) — this is what lets the UI switch
@@ -952,11 +969,107 @@ async function restoreFromEnvelopeUsecase({
 }> {
   const encryption = services.requireEncryption();
 
-  const { wrappedKey, encryptedPayload } = unpackBackupEnvelope({ envelope });
+  const { wrappedKey, payloadStart } = await readEnvelopeHeaderFromFile({ path: envelopePath });
   const dek = encryption.unwrapWithKek({ wrapped: wrappedKey });
 
-  const archive = encryption.decryptPayload({ encryptedPayload, key: dek });
-  const { manifest, files: unpackedFiles } = await services.packager.unpack({ archive });
+  let manifest: object;
+  let unpackedFiles: Map<string, string>; // file name -> path on disk
+  let extractDir: string;
+
+  try {
+    // Primary path: stream decrypt -> decompress -> untar straight to a temp
+    // directory, at most one document's bytes ever buffered at a time (see
+    // the per-document loop below).
+    const encryptedStream = createReadStream(envelopePath, { start: payloadStart });
+    const decryptStream = encryption.createPayloadDecryptStream({ key: dek });
+    // .pipe() doesn't forward source errors to the destination on its own —
+    // do it explicitly so a read error surfaces through decryptStream (which
+    // unpackStreamToDirectory is already listening on) instead of hanging.
+    encryptedStream.on('error', (error) => decryptStream.destroy(error));
+    const decryptedStream = encryptedStream.pipe(decryptStream);
+
+    const streamed = await unpackStreamToDirectory({ archiveStream: decryptedStream });
+    manifest = streamed.manifest;
+    unpackedFiles = streamed.files;
+    extractDir = streamed.extractDir;
+  } catch (streamingError) {
+    // A small number of very old backups used a different, non-streamable
+    // encrypted-payload layout (tag before ciphertext instead of after) that
+    // createPayloadDecryptStream can't parse incrementally. Every backup made
+    // by any version of the streaming packager uses the current layout, so
+    // this fallback should be rare — buffering here trades memory for
+    // compatibility with those older files.
+    logger.warn(
+      { error: streamingError },
+      'Streaming restore failed; falling back to fully-buffered restore (likely a legacy-format backup)',
+    );
+    const envelope = await readFile(envelopePath);
+    const { wrappedKey: legacyWrappedKey, encryptedPayload } = unpackBackupEnvelope({ envelope });
+    const legacyDek = encryption.unwrapWithKek({ wrapped: legacyWrappedKey });
+    const archive = encryption.decryptPayload({ encryptedPayload, key: legacyDek });
+    const buffered = await services.packager.unpack({ archive });
+    manifest = buffered.manifest;
+
+    extractDir = join(tmpdir(), `papra-restore-fallback-${randomBytes(12).toString('hex')}`);
+    await mkdir(extractDir, { recursive: true });
+    unpackedFiles = new Map();
+    let fallbackFileIndex = 0;
+    for (const [name, fileContent] of buffered.files) {
+      const filePath = join(extractDir, `file-${fallbackFileIndex++}`);
+      await writeFile(filePath, fileContent);
+      unpackedFiles.set(name, filePath);
+    }
+  }
+
+  try {
+    return await restoreManifestDocuments({
+      manifest,
+      unpackedFiles,
+      services,
+      documentUsecaseDeps,
+      documentsRepository,
+      foldersRepository,
+      organizationId,
+      userId,
+      onManifestReady,
+      onProgress,
+    });
+  } finally {
+    await removeExtractionDirectory({ extractDir });
+  }
+}
+
+// The actual document-import loop, factored out of restoreFromEnvelopeUsecase
+// so the decrypt/decompress/extract concerns above stay separate from "given
+// a manifest and files already sitting on disk, import them".
+async function restoreManifestDocuments({
+  manifest,
+  unpackedFiles,
+  services,
+  documentUsecaseDeps,
+  documentsRepository,
+  foldersRepository,
+  organizationId,
+  userId,
+  onManifestReady,
+  onProgress,
+}: {
+  manifest: object;
+  unpackedFiles: Map<string, string>;
+  services: BackupsServices;
+  documentUsecaseDeps: import('../app/server.types').GlobalDependencies;
+  documentsRepository: DocumentsRepository;
+  foldersRepository: FoldersRepository;
+  organizationId: string;
+  userId?: string;
+  onManifestReady?: (args: { totalDocumentsCount: number }) => void | Promise<void>;
+  onProgress?: (args: { processedCount: number; totalCount: number }) => void | Promise<void>;
+}): Promise<{
+  restoredDocumentsCount: number;
+  untrashedDocumentsCount: number;
+  skippedDuplicatesCount: number;
+  totalDocumentsCount: number;
+}> {
 
   const manifestDocs = (
     manifest as {
@@ -1174,7 +1287,7 @@ async function restoreFromEnvelopeUsecase({
     if (!matchingFileKey) {
       continue;
     }
-    const content = unpackedFiles.get(matchingFileKey)!;
+    const content = unpackedFiles.get(matchingFileKey)!; // path on disk, not a Buffer
 
     // Resolved once per entry, up front, so it's available regardless of
     // which branch below actually runs — restore should put a document back
@@ -1247,7 +1360,7 @@ async function restoreFromEnvelopeUsecase({
       continue;
     }
 
-    const fileStream: Readable = NodeReadable.from(content);
+    const fileStream: Readable = createReadStream(content);
 
     try {
       const { document } = await createDocument({
@@ -1472,24 +1585,30 @@ async function restoreArchiveUsecase({
   const driver = services.getDriver(destination.driver);
 
   await onDownloadStart?.();
-  const envelope = await driver.downloadFile({
-    credentials,
-    settings,
-    remoteFileId,
-    onProgress: onDownloadProgress,
-  });
+  const envelopePath = createEnvelopeSpoolPath();
+  try {
+    await driver.downloadFile({
+      credentials,
+      settings,
+      remoteFileId,
+      destinationPath: envelopePath,
+      onProgress: onDownloadProgress,
+    });
 
-  return restoreFromEnvelopeUsecase({
-    services,
-    documentUsecaseDeps,
-    documentsRepository,
-    foldersRepository,
-    organizationId,
-    envelope,
-    userId,
-    onManifestReady,
-    onProgress,
-  });
+    return await restoreFromEnvelopeUsecase({
+      services,
+      documentUsecaseDeps,
+      documentsRepository,
+      foldersRepository,
+      organizationId,
+      envelopePath,
+      userId,
+      onManifestReady,
+      onProgress,
+    });
+  } finally {
+    await deleteEnvelopeSpoolFile({ path: envelopePath });
+  }
 }
 
 // ----- Download a backup copy directly, no destination involved at all — a
@@ -1626,18 +1745,30 @@ export async function restoreFromUploadedFileUsecase({
     repository,
     jobId: job.id,
     logger: providedLogger,
-    execute: ({ onManifestReady, onProgress }) =>
-      restoreFromEnvelopeUsecase({
-        services,
-        documentUsecaseDeps,
-        documentsRepository,
-        foldersRepository,
-        organizationId,
-        envelope,
-        userId,
-        onManifestReady,
-        onProgress,
-      }),
+    execute: async ({ onManifestReady, onProgress }) => {
+      // The uploaded buffer is already fully in memory by the time it reaches
+      // here (that's the HTTP upload layer's concern, outside this function) —
+      // but writing it to a spool file once, upfront, still means the
+      // decrypt/decompress/untar chain below streams from disk instead of
+      // adding three more full-size in-memory copies on top of it.
+      const envelopePath = createEnvelopeSpoolPath();
+      await writeFile(envelopePath, envelope);
+      try {
+        return await restoreFromEnvelopeUsecase({
+          services,
+          documentUsecaseDeps,
+          documentsRepository,
+          foldersRepository,
+          organizationId,
+          envelopePath,
+          userId,
+          onManifestReady,
+          onProgress,
+        });
+      } finally {
+        await deleteEnvelopeSpoolFile({ path: envelopePath });
+      }
+    },
   });
 
   return { jobId: job.id };
@@ -1994,63 +2125,111 @@ export async function verifyBackupRunUsecase({
     const settings = JSON.parse(destination.settingsJson) as Record<string, unknown>;
     const driver = services.getDriver(destination.driver);
 
-    const envelope = await driver.downloadFile({
-      credentials,
-      settings,
-      remoteFileId: run.remoteFileId,
-    });
+    const envelopePath = createEnvelopeSpoolPath();
+    try {
+      await driver.downloadFile({
+        credentials,
+        settings,
+        remoteFileId: run.remoteFileId,
+        destinationPath: envelopePath,
+      });
 
-    // Unpack and verify
-    const { wrappedKey, encryptedPayload } = unpackBackupEnvelope({ envelope });
-    const dek = encryption.unwrapWithKek({ wrapped: wrappedKey });
+      // Same streaming decrypt/decompress/untar-to-disk approach as restore —
+      // buffering the whole archive plus every document's Map<string, Buffer>
+      // simultaneously is what OOM-killed large-org verification the same way
+      // it did restores.
+      const { wrappedKey, payloadStart } = await readEnvelopeHeaderFromFile({ path: envelopePath });
+      const dek = encryption.unwrapWithKek({ wrapped: wrappedKey });
 
-    const archive = encryption.decryptPayload({ encryptedPayload, key: dek });
-    const { manifest, files: unpackedFiles } = await services.packager.unpack({ archive });
+      let manifest: object;
+      let unpackedFiles: Map<string, string>;
+      let extractDir: string;
+      try {
+        const encryptedStream = createReadStream(envelopePath, { start: payloadStart });
+        const decryptStream = encryption.createPayloadDecryptStream({ key: dek });
+        encryptedStream.on('error', (error) => decryptStream.destroy(error));
+        const decryptedStream = encryptedStream.pipe(decryptStream);
 
-    const manifestDocs = (
-      manifest as {
-        documents: {
-          id: string;
-          originalSha256Hash: string;
-        }[];
-      }
-    ).documents;
-
-    // Verify each document's hash
-    let validCount = 0;
-    let invalidCount = 0;
-
-    for (const doc of manifestDocs) {
-      // Find the file in the archive that matches this document
-      // Files are named as "files/{doc.id}-{originalName}" in the tar archive
-      // After unpacking, the key is just "{doc.id}-{originalName}"
-      const fileKey = Array.from(unpackedFiles.keys()).find((key) => key.startsWith(`${doc.id}-`));
-      if (!fileKey) {
-        errors.push(`Document ${doc.id}: file not found in backup archive`);
-        invalidCount++;
-        continue;
-      }
-
-      const content = unpackedFiles.get(fileKey)!;
-      const actualHash = services.packager.computeHash(content);
-
-      if (actualHash !== doc.originalSha256Hash) {
-        errors.push(
-          `Document ${doc.id}: hash mismatch (expected ${doc.originalSha256Hash}, got ${actualHash})`,
+        const streamed = await unpackStreamToDirectory({ archiveStream: decryptedStream });
+        manifest = streamed.manifest;
+        unpackedFiles = streamed.files;
+        extractDir = streamed.extractDir;
+      } catch (streamingError) {
+        logger.warn(
+          { error: streamingError },
+          'Streaming verify failed; falling back to fully-buffered verify (likely a legacy-format backup)',
         );
-        invalidCount++;
-      } else {
-        validCount++;
-      }
-    }
+        const envelope = await readFile(envelopePath);
+        const { wrappedKey: legacyWrappedKey, encryptedPayload } = unpackBackupEnvelope({ envelope });
+        const legacyDek = encryption.unwrapWithKek({ wrapped: legacyWrappedKey });
+        const archive = encryption.decryptPayload({ encryptedPayload, key: legacyDek });
+        const buffered = await services.packager.unpack({ archive });
+        manifest = buffered.manifest;
 
-    return {
-      valid: errors.length === 0,
-      totalDocuments: manifestDocs.length,
-      validDocuments: validCount,
-      invalidDocuments: invalidCount,
-      errors,
-    };
+        extractDir = join(tmpdir(), `papra-verify-fallback-${randomBytes(12).toString('hex')}`);
+        await mkdir(extractDir, { recursive: true });
+        unpackedFiles = new Map();
+        let fallbackFileIndex = 0;
+        for (const [name, fileContent] of buffered.files) {
+          const filePath = join(extractDir, `file-${fallbackFileIndex++}`);
+          await writeFile(filePath, fileContent);
+          unpackedFiles.set(name, filePath);
+        }
+      }
+
+      try {
+        const manifestDocs = (
+          manifest as {
+            documents: {
+              id: string;
+              originalSha256Hash: string;
+            }[];
+          }
+        ).documents;
+
+        // Verify each document's hash
+        let validCount = 0;
+        let invalidCount = 0;
+
+        for (const doc of manifestDocs) {
+          // Find the file in the archive that matches this document
+          // Files are named as "files/{doc.id}-{originalName}" in the tar archive
+          // After unpacking, the key is just "{doc.id}-{originalName}"
+          const fileKey = Array.from(unpackedFiles.keys()).find((key) => key.startsWith(`${doc.id}-`));
+          if (!fileKey) {
+            errors.push(`Document ${doc.id}: file not found in backup archive`);
+            invalidCount++;
+            continue;
+          }
+
+          // Read one document at a time off disk rather than holding every
+          // document's bytes in memory simultaneously.
+          const content = await readFile(unpackedFiles.get(fileKey)!);
+          const actualHash = services.packager.computeHash(content);
+
+          if (actualHash !== doc.originalSha256Hash) {
+            errors.push(
+              `Document ${doc.id}: hash mismatch (expected ${doc.originalSha256Hash}, got ${actualHash})`,
+            );
+            invalidCount++;
+          } else {
+            validCount++;
+          }
+        }
+
+        return {
+          valid: errors.length === 0,
+          totalDocuments: manifestDocs.length,
+          validDocuments: validCount,
+          invalidDocuments: invalidCount,
+          errors,
+        };
+      } finally {
+        await removeExtractionDirectory({ extractDir });
+      }
+    } finally {
+      await deleteEnvelopeSpoolFile({ path: envelopePath });
+    }
   } catch (error) {
     errors.push((error as Error).message);
     return {

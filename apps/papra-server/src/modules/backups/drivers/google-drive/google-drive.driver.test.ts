@@ -1,5 +1,9 @@
 import type { Config } from '../../../config/config.types';
 import { afterEach, describe, expect, test, vi } from 'vitest';
+import { randomBytes } from 'node:crypto';
+import { readFile, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { googleDriveBackupDriverFactory } from './google-drive.driver';
 import {
   GOOGLE_DRIVE_OAUTH_TOKEN_ENDPOINT,
@@ -113,5 +117,56 @@ describe('google drive driver', () => {
     });
 
     expect(Buffer.from(putCalls[0]!.init!.body as Uint8Array).toString()).toBe('backup-bytes');
+  });
+
+  test('downloadFile streams the response body straight to disk instead of buffering it', async () => {
+    const chunks = [Buffer.from('hello '), Buffer.from('streamed '), Buffer.from('world')];
+    const totalLength = chunks.reduce((sum, c) => sum + c.length, 0);
+
+    const fetchMock = vi.fn(async (url: string | URL) => {
+      const href = String(url);
+      if (href.startsWith(GOOGLE_DRIVE_OAUTH_TOKEN_ENDPOINT)) {
+        return jsonResponse({ access_token: 'at', expires_in: 3600, token_type: 'Bearer' });
+      }
+      let index = 0;
+      const body = new ReadableStream<Uint8Array>({
+        pull(controller) {
+          if (index < chunks.length) {
+            controller.enqueue(chunks[index]!);
+            index += 1;
+          } else {
+            controller.close();
+          }
+        },
+      });
+      return {
+        ok: true,
+        status: 200,
+        headers: { get: (name: string) => (name.toLowerCase() === 'content-length' ? String(totalLength) : null) },
+        body,
+      } as unknown as Response;
+    }) as unknown as typeof fetch;
+    vi.stubGlobal('fetch', fetchMock);
+
+    const driver = createDriver();
+    const destinationPath = join(tmpdir(), `gdrive-download-test-${randomBytes(6).toString('hex')}`);
+    const progressUpdates: { downloadedBytes: number; totalBytes: number | null }[] = [];
+
+    try {
+      const result = await driver.downloadFile({
+        credentials: { refreshToken: 'rt' },
+        settings: {},
+        remoteFileId: 'gfile_1',
+        destinationPath,
+        onProgress: (args) => progressUpdates.push(args),
+      });
+
+      expect(result.size).toBe(totalLength);
+      expect((await readFile(destinationPath)).toString()).toBe('hello streamed world');
+      expect(progressUpdates.length).toBeGreaterThan(0);
+      expect(progressUpdates.at(-1)).toEqual({ downloadedBytes: totalLength, totalBytes: totalLength });
+    } finally {
+      await rm(destinationPath, { force: true });
+    }
   });
 });

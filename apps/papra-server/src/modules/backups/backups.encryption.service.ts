@@ -1,5 +1,7 @@
 import type { Config } from '../config/config.types';
+import type { DecipherGCM } from 'node:crypto';
 import { createCipheriv, createDecipheriv, randomBytes } from 'node:crypto';
+import { open } from 'node:fs/promises';
 import { Transform } from 'node:stream';
 import { decrypt, encrypt } from '../shared/crypto/encryption';
 import { createBackupsNotConfiguredError, createBackupInvalidFileError } from './backups.errors';
@@ -47,6 +49,16 @@ export interface BackupEncryptionService {
   // tag can only be computed after all ciphertext, so a single streaming pass
   // cannot put it first. The payload deliberately uses the streamable order.
   createPayloadEncryptStream(args: { key: Buffer }): Transform;
+  // Streaming twin of decryptPayload for the current [iv][ciphertext][tag]
+  // layout only (no legacy-layout fallback — that format was only ever
+  // produced by the old in-RAM builder and can't be told apart from the
+  // current layout without buffering, so callers that might see a legacy
+  // file should fall back to decryptPayload() on failure). Holds back the
+  // trailing TAG_LENGTH bytes at all times since GCM's auth tag can only be
+  // verified once every ciphertext byte has been seen, then verifies it in
+  // flush() — same holdback technique as the document-storage decrypt
+  // transformer in shared/crypto/encryption.ts.
+  createPayloadDecryptStream(args: { key: Buffer }): Transform;
 }
 
 export function createBackupEncryptionService({
@@ -133,6 +145,71 @@ export function createBackupEncryptionService({
       } catch {
         return decrypt({ encryptedValue: encryptedPayload, key });
       }
+    },
+
+    createPayloadDecryptStream({ key }: { key: Buffer }): Transform {
+      let iv: Buffer | undefined;
+      let ivBuffer = Buffer.alloc(0);
+      let decipher: DecipherGCM | undefined;
+      let heldTailBytes = Buffer.alloc(0);
+
+      return new Transform({
+        transform(chunk: Buffer, _encoding, callback) {
+          try {
+            let incoming = Buffer.concat([heldTailBytes, chunk]);
+
+            if (!iv) {
+              const needed = IV_LENGTH - ivBuffer.length;
+              const ivChunk = incoming.subarray(0, needed);
+              ivBuffer = Buffer.concat([ivBuffer, ivChunk]);
+              incoming = incoming.subarray(ivChunk.length);
+              if (ivBuffer.length < IV_LENGTH) {
+                // Still waiting on more bytes for a full IV — nothing to
+                // decrypt or hold back yet.
+                heldTailBytes = Buffer.alloc(0);
+                callback();
+                return;
+              }
+              iv = ivBuffer;
+              decipher = createDecipheriv(ALGORITHM, key, iv) as DecipherGCM;
+            }
+
+            // Always hold back the trailing TAG_LENGTH bytes — they might be
+            // (part of) the auth tag, which only arrives once the stream ends.
+            if (incoming.length <= TAG_LENGTH) {
+              heldTailBytes = incoming;
+              callback();
+              return;
+            }
+            const ciphertext = incoming.subarray(0, incoming.length - TAG_LENGTH);
+            heldTailBytes = incoming.subarray(incoming.length - TAG_LENGTH);
+
+            const decrypted = decipher!.update(ciphertext);
+            if (decrypted.length > 0) {
+              this.push(decrypted);
+            }
+            callback();
+          } catch (error) {
+            callback(error instanceof Error ? error : new Error(String(error)));
+          }
+        },
+        flush(callback) {
+          try {
+            if (!decipher || heldTailBytes.length !== TAG_LENGTH) {
+              callback(createBackupInvalidFileError());
+              return;
+            }
+            decipher.setAuthTag(heldTailBytes);
+            const final = decipher.final();
+            if (final.length > 0) {
+              this.push(final);
+            }
+            callback();
+          } catch (error) {
+            callback(error instanceof Error ? error : new Error(String(error)));
+          }
+        },
+      });
     },
   };
 }
@@ -221,4 +298,35 @@ export function unpackBackupEnvelope({ envelope }: { envelope: Buffer }): {
   const wrappedKey = envelope.subarray(4, 4 + keyLength).toString('utf8');
   const encryptedPayload = envelope.subarray(4 + keyLength);
   return { wrappedKey, encryptedPayload };
+}
+
+// Reads just the wrapped-key header (a few hundred bytes at most) directly off
+// disk instead of loading the whole envelope into memory first — the payload
+// itself (the actual multi-hundred-MB backup content) is never touched here.
+// Callers stream the payload separately from payloadStart onward.
+export async function readEnvelopeHeaderFromFile({
+  path,
+}: {
+  path: string;
+}): Promise<{ wrappedKey: string; payloadStart: number }> {
+  const fileHandle = await open(path, 'r');
+  try {
+    const lengthBuffer = Buffer.alloc(4);
+    const { bytesRead: lengthBytesRead } = await fileHandle.read(lengthBuffer, 0, 4, 0);
+    if (lengthBytesRead < 4) {
+      throw createBackupInvalidFileError();
+    }
+    const keyLength = lengthBuffer.readUInt32BE(0);
+    if (keyLength === 0) {
+      throw createBackupInvalidFileError();
+    }
+    const keyBuffer = Buffer.alloc(keyLength);
+    const { bytesRead: keyBytesRead } = await fileHandle.read(keyBuffer, 0, keyLength, 4);
+    if (keyBytesRead < keyLength) {
+      throw createBackupInvalidFileError();
+    }
+    return { wrappedKey: keyBuffer.toString('utf8'), payloadStart: 4 + keyLength };
+  } finally {
+    await fileHandle.close();
+  }
 }

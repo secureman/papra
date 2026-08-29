@@ -1,4 +1,6 @@
 import { Readable, Writable } from 'node:stream';
+import { createWriteStream } from 'node:fs';
+import { stat } from 'node:fs/promises';
 import { Client } from 'basic-ftp';
 import { createLogger } from '../../../shared/logger/logger';
 import { createBackupDriverApiError } from '../../backups.errors';
@@ -125,25 +127,30 @@ export const ftpBackupDriverFactory = defineBackupDriver(() => {
       return { remoteFileId: `${folderRef}/${fileName}`, remoteFileName: fileName };
     },
 
-    async downloadFile({ credentials, settings, remoteFileId }) {
+    async downloadFile({ credentials, settings, remoteFileId, destinationPath, onProgress }) {
       const s = settings as unknown as FtpSettings;
-      const chunks: Buffer[] = [];
       await withClient({
         credentials,
         settings: s,
         fn: async (client) => {
-          await client.downloadTo(
-            new Writable({
-              write(chunk: Buffer, _enc: string, cb: () => void) {
-                chunks.push(chunk);
-                cb();
-              },
-            }),
-            remoteFileId,
-          );
+          if (onProgress) {
+            client.trackProgress((info) =>
+              onProgress({ downloadedBytes: info.bytesOverall, totalBytes: null }),
+            );
+          }
+          try {
+            // basic-ftp streams straight into whatever Writable it's given —
+            // pointing it at a file on disk instead of an in-memory chunk
+            // array means the download never holds the file's bytes in RAM
+            // at all, regardless of how large it is.
+            await client.downloadTo(createWriteStream(destinationPath), remoteFileId);
+          } finally {
+            client.trackProgress(); // stop tracking so the handler isn't kept alive/reused across calls
+          }
         },
       });
-      return Buffer.concat(chunks);
+      const { size } = await stat(destinationPath);
+      return { size };
     },
 
     async deleteFile({ credentials, settings, remoteFileId }) {

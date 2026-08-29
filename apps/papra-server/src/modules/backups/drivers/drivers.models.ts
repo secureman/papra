@@ -73,13 +73,19 @@ export type BackupDriver = {
     credentials: BackupDriverCredentials;
     settings: BackupDriverSettings;
     remoteFileId: string;
+    // Every driver streams the download straight to this path instead of
+    // returning a Buffer — a backup file can be hundreds of MB, and buffering
+    // it (twice, once for the driver's own chunk collection and once more for
+    // Buffer.concat) is what OOM-killed restores on memory-constrained hosts
+    // (Termux/udocker). Restore reads the file back off disk afterwards.
+    destinationPath: string;
     // Optional: drivers that can report byte-level progress during download
     // (streamed HTTP responses with a known Content-Length) should call this
-    // periodically. Drivers that can't (e.g. buffer the whole thing at once
-    // with no size up front) can just ignore it — restore still works, it
-    // just won't show progress during this specific phase.
+    // periodically. Drivers that can't (e.g. no Content-Length up front) can
+    // just ignore it — restore still works, it just won't show progress
+    // during this specific phase.
     onProgress?: (args: { downloadedBytes: number; totalBytes: number | null }) => void;
-  }) => Promise<Buffer>;
+  }) => Promise<{ size: number }>;
 
   deleteFile: (args: {
     credentials: BackupDriverCredentials;

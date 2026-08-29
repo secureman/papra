@@ -1,4 +1,8 @@
 import { Buffer } from 'node:buffer';
+import { createWriteStream } from 'node:fs';
+import { stat } from 'node:fs/promises';
+import { Readable } from 'node:stream';
+import { pipeline } from 'node:stream/promises';
 import { createLogger } from '../../../shared/logger/logger';
 import { BACKUP_FILE_EXTENSION } from '../../backups.constants';
 import { createBackupDriverApiError } from '../../backups.errors';
@@ -233,7 +237,7 @@ export const webdavBackupDriverFactory = defineBackupDriver(() => {
       return { remoteFileId: path, remoteFileName: fileName };
     },
 
-    async downloadFile({ credentials, settings, remoteFileId }) {
+    async downloadFile({ credentials, settings, remoteFileId, destinationPath, onProgress }) {
       const s = settings as unknown as WebdavSettings;
       const response = await request({
         settings: s,
@@ -241,8 +245,40 @@ export const webdavBackupDriverFactory = defineBackupDriver(() => {
         path: remoteFileId,
         method: 'GET',
       });
-      const arrayBuffer = await response.arrayBuffer();
-      return Buffer.from(arrayBuffer);
+
+      if (!response.body) {
+        // No streamable body — fall back to buffering the whole thing at
+        // once. No progress in this case, but the download itself still works.
+        const arrayBuffer = await response.arrayBuffer();
+        await pipeline(Readable.from(Buffer.from(arrayBuffer)), createWriteStream(destinationPath));
+        const { size } = await stat(destinationPath);
+        return { size };
+      }
+
+      const totalBytes = (() => {
+        const header = response.headers.get('content-length');
+        const parsed = header ? Number(header) : Number.NaN;
+        return Number.isFinite(parsed) ? parsed : null;
+      })();
+
+      let downloadedBytes = 0;
+      // Streamed straight to disk instead of buffered fully via
+      // response.arrayBuffer() — a large backup file previously meant the
+      // whole file resident in memory at once, which is what OOM-killed
+      // restores on memory-constrained hosts (Termux/udocker).
+      await pipeline(
+        Readable.fromWeb(response.body as import('node:stream/web').ReadableStream<Uint8Array>).on(
+          'data',
+          (chunk: Buffer) => {
+            downloadedBytes += chunk.length;
+            onProgress?.({ downloadedBytes, totalBytes });
+          },
+        ),
+        createWriteStream(destinationPath),
+      );
+
+      const { size } = await stat(destinationPath);
+      return { size };
     },
 
     async deleteFile({ credentials, settings, remoteFileId }) {

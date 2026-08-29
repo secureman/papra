@@ -1,5 +1,9 @@
 import type { Config } from '../config/config.types';
 import { describe, expect, test } from 'vitest';
+import { randomBytes } from 'node:crypto';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { rm, writeFile } from 'node:fs/promises';
 import { Readable, Writable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { encrypt } from '../shared/crypto/encryption';
@@ -8,6 +12,7 @@ import {
   packBackupEnvelope,
   unwrapCredentials,
   unpackBackupEnvelope,
+  readEnvelopeHeaderFromFile,
   wrapCredentials,
 } from './backups.encryption.service';
 
@@ -155,3 +160,108 @@ describe('backup encryption service', () => {
     );
   });
 });
+
+describe('readEnvelopeHeaderFromFile', () => {
+  test('matches unpackBackupEnvelope on the same file', async () => {
+    const service = createService();
+    const key = service.generateBackupKey();
+    const wrapped = service.wrapWithKek({ value: key });
+    const encryptedPayload = service.encryptPayload({ payload: Buffer.from('payload bytes'), key });
+    const envelope = packBackupEnvelope({ wrappedKey: wrapped, encryptedPayload });
+
+    const tmpPath = join(tmpdir(), `envelope-header-test-${randomBytes(6).toString('hex')}`);
+    await writeFile(tmpPath, envelope);
+    try {
+      const fromBuffer = unpackBackupEnvelope({ envelope });
+      const fromFile = await readEnvelopeHeaderFromFile({ path: tmpPath });
+
+      expect(fromFile.wrappedKey).toBe(fromBuffer.wrappedKey);
+      expect(envelope.subarray(fromFile.payloadStart).equals(fromBuffer.encryptedPayload)).toBe(true);
+    } finally {
+      await rm(tmpPath, { force: true });
+    }
+  });
+
+  test('rejects a truncated file the same way unpackBackupEnvelope rejects a truncated buffer', async () => {
+    const tmpPath = join(tmpdir(), `envelope-header-truncated-${randomBytes(6).toString('hex')}`);
+    await writeFile(tmpPath, Buffer.alloc(2));
+    try {
+      await expect(readEnvelopeHeaderFromFile({ path: tmpPath })).rejects.toThrow(
+        expect.objectContaining({ code: 'backups.invalid_file' }),
+      );
+    } finally {
+      await rm(tmpPath, { force: true });
+    }
+  });
+});
+
+describe('createPayloadDecryptStream', () => {
+  test('round-trips through createPayloadEncryptStream (small payload)', async () => {
+    const service = createService();
+    const key = service.generateBackupKey();
+    const payload = Buffer.from('hello backup world');
+
+    const chunks: Buffer[] = [];
+    await pipeline(
+      Readable.from(payload),
+      service.createPayloadEncryptStream({ key }),
+      service.createPayloadDecryptStream({ key }),
+      new Writable({
+        write(chunk, _encoding, callback) {
+          chunks.push(Buffer.from(chunk));
+          callback();
+        },
+      }),
+    );
+
+    expect(Buffer.concat(chunks).toString()).toBe('hello backup world');
+  });
+
+  test('round-trips a large payload delivered across many small chunks', async () => {
+    const service = createService();
+    const key = service.generateBackupKey();
+    const payload = Buffer.from('x'.repeat(500_000));
+
+    // Feed the encrypted bytes through the decrypt stream in tiny, awkward
+    // chunk sizes to exercise the IV/tag holdback boundary logic.
+    const encrypted = service.encryptPayload({ payload, key });
+    const chunks: Buffer[] = [];
+    await pipeline(
+      Readable.from(chunkBuffer(encrypted, 7)),
+      service.createPayloadDecryptStream({ key }),
+      new Writable({
+        write(chunk, _encoding, callback) {
+          chunks.push(Buffer.from(chunk));
+          callback();
+        },
+      }),
+    );
+
+    expect(Buffer.concat(chunks).equals(payload)).toBe(true);
+  });
+
+  test('rejects a payload with a tampered auth tag', async () => {
+    const service = createService();
+    const key = service.generateBackupKey();
+    const encrypted = service.encryptPayload({ payload: Buffer.from('hi'), key });
+    encrypted[encrypted.length - 1] = (encrypted[encrypted.length - 1]! ^ 0xff) & 0xff; // flip a bit in the tag
+
+    await expect(
+      pipeline(
+        Readable.from(encrypted),
+        service.createPayloadDecryptStream({ key }),
+        new Writable({
+          write(_chunk, _encoding, callback) {
+            callback();
+          },
+        }),
+      ),
+    ).rejects.toThrow();
+  });
+});
+
+function* chunkBuffer(buffer: Buffer, size: number): Generator<Buffer> {
+  for (let offset = 0; offset < buffer.length; offset += size) {
+    yield buffer.subarray(offset, offset + size);
+  }
+}

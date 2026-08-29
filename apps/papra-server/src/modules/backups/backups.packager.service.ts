@@ -1,8 +1,37 @@
 import { Buffer } from 'node:buffer';
-import { createHash } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
+import { createWriteStream } from 'node:fs';
+import { mkdir, readFile, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join, resolve, sep } from 'node:path';
+import { pipeline } from 'node:stream/promises';
 import { Readable, Transform } from 'node:stream';
-import { createGzip, createGunzip } from 'node:zlib';
+import {
+  createGunzip,
+  createBrotliCompress,
+  createBrotliDecompress,
+  constants as zlibConstants,
+} from 'node:zlib';
 import { isNil } from '../shared/utils';
+
+// Brotli quality for backup archives. Brotli beats gzip's ratio noticeably on
+// text-heavy content (exported/text PDFs, JSON manifests, OCR text) at a
+// comparable quality-to-speed tradeoff, and ships in Node core so it costs no
+// extra dependency. Quality 5 stays roughly gzip-default speed (important on
+// constrained self-hosted hardware like Termux/udocker boxes) while still
+// improving the ratio — bump toward 9-11 later if CPU headroom allows and
+// backup duration isn't a concern.
+const BROTLI_QUALITY = 5;
+export const BROTLI_OPTIONS = {
+  params: {
+    [zlibConstants.BROTLI_PARAM_QUALITY]: BROTLI_QUALITY,
+  },
+};
+
+// Gzip's magic number (0x1f 0x8b) lets unpack() tell old gzip-compressed
+// backups apart from newer brotli ones with no format version field needed —
+// same "detect by trying" spirit as decryptPayload's legacy-layout fallback.
+const GZIP_MAGIC = Buffer.from([0x1f, 0x8b]);
 
 // Minimal hand-rolled tar packer/unpacker. Why no `tar` npm package?
 //   - Most tar libs are 50KB+ with full pax/ustar support
@@ -201,6 +230,271 @@ function unpackTar(buffer: Buffer): TarEntry[] {
   return entries;
 }
 
+// Streaming twin of unpackTar(): parses the same ustar byte stream but writes
+// each entry straight to a file under extractDir instead of collecting every
+// entry as an in-memory Buffer. This is what makes restoring a large org
+// possible on memory-constrained hosts (Termux/udocker) — unpackTar() holds
+// every document in RAM simultaneously (~500 docs * 1-2MB = a full org's worth
+// of RSS on top of the tarball itself), which is exactly what OOM-killed
+// restores of large backups. Emits {name, path} objects on the readable side
+// as each entry finishes writing.
+export function createTarExtractTransform({ extractDir }: { extractDir: string }): Transform {
+  let buffered = Buffer.alloc(0);
+  // Current entry being written, if any.
+  let currentName: string | null = null;
+  let currentRemaining = 0; // content bytes still to come
+  let currentPadding = 0; // zero-padding bytes still to come, after content
+  let currentStream: ReturnType<typeof createWriteStream> | null = null;
+  let endOfArchive = false;
+  const pendingEntries: { name: string; path: string }[] = [];
+
+  // Closes the current entry's write stream and only marks it "done" once the
+  // OS has actually confirmed every byte was written (the 'finish' event) —
+  // not merely once .end() was called. Marking an entry done too early (the
+  // original bug here) let restore read a file back before its last buffered
+  // writes had actually landed on disk, silently truncating documents under
+  // real I/O load — invisible in small/fast tests, real at hundreds of files.
+  function closeCurrentEntry(): Promise<void> {
+    return new Promise((resolvePromise, reject) => {
+      if (!currentStream) {
+        resolvePromise();
+        return;
+      }
+      const streamToClose = currentStream;
+      const name = currentName!;
+      const onFinish = () => {
+        streamToClose.off('error', onError);
+        pendingEntries.push({ name, path: resolveEntryPath({ extractDir, name }) });
+        resolvePromise();
+      };
+      const onError = (error: Error) => {
+        streamToClose.off('finish', onFinish);
+        reject(error);
+      };
+      streamToClose.once('finish', onFinish);
+      streamToClose.once('error', onError);
+      streamToClose.end();
+    });
+  }
+
+  return new Transform({
+    readableObjectMode: true,
+    async transform(chunk: Buffer, _encoding, callback) {
+      try {
+        buffered = Buffer.concat([buffered, chunk]);
+
+        for (;;) {
+          if (endOfArchive) {
+            break; // ignore any trailing bytes after the end-of-archive marker
+          }
+
+          if (currentStream) {
+            // Draining the current entry's content + padding.
+            const toWriteAsContent = Math.min(currentRemaining, buffered.length);
+            if (toWriteAsContent > 0) {
+              await writeChunk(currentStream, buffered.subarray(0, toWriteAsContent));
+              buffered = buffered.subarray(toWriteAsContent);
+              currentRemaining -= toWriteAsContent;
+            }
+            if (currentRemaining > 0) {
+              break; // need more data
+            }
+            const toSkipAsPadding = Math.min(currentPadding, buffered.length);
+            buffered = buffered.subarray(toSkipAsPadding);
+            currentPadding -= toSkipAsPadding;
+            if (currentPadding > 0) {
+              break; // need more data
+            }
+            await closeCurrentEntry();
+            currentName = null;
+            currentStream = null;
+            currentRemaining = 0;
+            currentPadding = 0;
+            continue;
+          }
+
+          if (buffered.length < BLOCK_SIZE) {
+            break; // need a full header block
+          }
+          const header = buffered.subarray(0, BLOCK_SIZE);
+          if (header.every((b) => b === 0)) {
+            endOfArchive = true;
+            buffered = Buffer.alloc(0);
+            break;
+          }
+          buffered = buffered.subarray(BLOCK_SIZE);
+
+          const nameField = readString(header, 0, MAX_NAME_FIELD_LENGTH);
+          const prefixField = readString(header, 345, MAX_PREFIX_FIELD_LENGTH);
+          const name = prefixField ? `${prefixField}/${nameField}` : nameField;
+          const size = readOctal(header, 124, 12);
+          const padded = padToBlock(Buffer.alloc(size)).length;
+
+          const path = resolveEntryPath({ extractDir, name });
+          await mkdir(join(path, '..'), { recursive: true });
+          currentName = name;
+          currentStream = createWriteStream(path);
+          currentRemaining = size;
+          currentPadding = padded - size;
+        }
+
+        for (const entry of pendingEntries.splice(0)) {
+          this.push(entry);
+        }
+        callback();
+      } catch (error) {
+        callback(error instanceof Error ? error : new Error(String(error)));
+      }
+    },
+    flush(callback) {
+      if (currentStream) {
+        // Ended mid-entry — the archive was truncated.
+        callback(new Error('Backup archive ended unexpectedly mid-entry'));
+        return;
+      }
+      for (const entry of pendingEntries.splice(0)) {
+        this.push(entry);
+      }
+      callback();
+    },
+  });
+}
+
+function writeChunk(stream: NodeJS.WritableStream, chunk: Buffer): Promise<void> {
+  return new Promise((resolvePromise, reject) => {
+    if (stream.write(chunk)) {
+      resolvePromise();
+      return;
+    }
+    // Whichever of drain/error fires first must remove the other listener —
+    // otherwise, on a large file needing many backpressured writes, every
+    // resolved-via-drain call leaves its paired 'error' listener attached
+    // forever, piling up hundreds of dangling listeners on one stream over
+    // the life of a big file (surfaces as Node's MaxListenersExceededWarning
+    // under real load, invisible on small test fixtures).
+    const onDrain = () => {
+      stream.off('error', onError);
+      resolvePromise();
+    };
+    const onError = (error: Error) => {
+      stream.off('drain', onDrain);
+      reject(error);
+    };
+    stream.once('drain', onDrain);
+    stream.once('error', onError);
+  });
+}
+
+// Guards against a corrupted or crafted archive writing outside extractDir
+// (tar-slip / zip-slip): resolve the entry path and verify it's still nested
+// under extractDir before ever touching the filesystem.
+function resolveEntryPath({ extractDir, name }: { extractDir: string; name: string }): string {
+  const resolved = resolve(extractDir, name);
+  if (resolved !== extractDir && !resolved.startsWith(extractDir + sep)) {
+    throw new Error(`Backup archive entry path escapes the extraction directory: "${name}"`);
+  }
+  return resolved;
+}
+
+const GZIP_MAGIC_BYTES = Buffer.from([0x1f, 0x8b]);
+
+// Sniffs the first 2 bytes of a stream to pick gzip vs brotli decompression
+// without buffering the whole thing — same gzip magic number used by
+// decompressArchive() above, just streaming. The sniffed bytes are re-emitted
+// as the first chunk of the returned stream, so nothing is lost.
+async function createAutoDetectDecompressStream(source: Readable): Promise<Readable> {
+  const sniffed = await new Promise<Buffer>((resolvePromise, reject) => {
+    let collected = Buffer.alloc(0);
+    function onData(chunk: Buffer) {
+      collected = Buffer.concat([collected, chunk]);
+      if (collected.length >= 2) {
+        source.pause();
+        source.off('data', onData);
+        source.off('end', onEnd);
+        source.off('error', onError);
+        resolvePromise(collected);
+      }
+    }
+    function onEnd() {
+      source.off('data', onData);
+      source.off('error', onError);
+      resolvePromise(collected);
+    }
+    function onError(error: Error) {
+      source.off('data', onData);
+      source.off('end', onEnd);
+      reject(error);
+    }
+    source.on('data', onData);
+    source.once('end', onEnd);
+    source.once('error', onError);
+  });
+
+  const isGzip = sniffed.length >= 2 && sniffed.subarray(0, 2).equals(GZIP_MAGIC_BYTES);
+  const reconstructed = Readable.from(
+    (async function* () {
+      yield sniffed;
+      yield* source;
+    })(),
+  );
+  return reconstructed.pipe(isGzip ? createGunzip() : createBrotliDecompress());
+}
+
+// Streaming twin of BackupPackagerService.unpack(): decompresses + extracts
+// an archive stream straight to files under a fresh temp directory instead of
+// building a Map<string, Buffer> of every document at once. Caller owns the
+// returned directory and must remove it (see removeExtractionDirectory).
+export async function unpackStreamToDirectory({
+  archiveStream,
+}: {
+  archiveStream: Readable;
+}): Promise<{ manifest: object; files: Map<string, string>; extractDir: string }> {
+  const extractDir = join(tmpdir(), `papra-restore-extract-${randomBytes(12).toString('hex')}`);
+  await mkdir(extractDir, { recursive: true });
+
+  try {
+    const decompressed = await createAutoDetectDecompressStream(archiveStream);
+    const extracted: { name: string; path: string }[] = [];
+
+    await pipeline(
+      decompressed,
+      createTarExtractTransform({ extractDir }),
+      async function collect(source: AsyncIterable<{ name: string; path: string }>) {
+        for await (const entry of source) {
+          extracted.push(entry);
+        }
+      },
+    );
+
+    const manifestEntry = extracted.find((e) => e.name === 'manifest.json');
+    if (!manifestEntry) {
+      throw new Error('Backup archive is missing manifest.json');
+    }
+    const manifest = JSON.parse(await readFile(manifestEntry.path, 'utf8')) as object;
+
+    const files = new Map<string, string>();
+    for (const entry of extracted) {
+      if (entry.name.startsWith('files/')) {
+        files.set(entry.name.slice('files/'.length), entry.path);
+      }
+    }
+
+    return { manifest, files, extractDir };
+  } catch (error) {
+    await removeExtractionDirectory({ extractDir });
+    throw error;
+  }
+}
+
+// Best-effort cleanup for the directory unpackStreamToDirectory() creates.
+export async function removeExtractionDirectory({
+  extractDir,
+}: {
+  extractDir: string;
+}): Promise<void> {
+  await rm(extractDir, { recursive: true, force: true });
+}
+
 // Streaming twin of packTar(): accepts entries one at a time (object mode) and
 // emits the exact same ustar bytes, ending with the two zero blocks on flush.
 // Used by the envelope builder so a backup never holds more than ONE document
@@ -240,9 +534,11 @@ export function createTarPackTransform(): Transform {
   });
 }
 
-// High-level service. Handles gzip on top of tar so the final upload is a
-// compressed archive — important for backups of full PDFs/images where the
-// compression ratio is decent.
+// High-level service. Handles brotli compression on top of tar so the final
+// upload is a compressed archive. Note the ratio ceiling: PDFs/images that are
+// already internally compressed (scanned pages, embedded JPEGs) won't shrink
+// much further under any general-purpose compressor — this mainly helps
+// text-heavy content (exported/text PDFs, JSON manifests, OCR sidecars).
 export function createBackupPackagerService() {
   return {
     // Build a compressed backup from the manifest + file map. Returns the
@@ -259,7 +555,7 @@ export function createBackupPackagerService() {
         ...files.map(({ name, content }) => ({ name: `files/${name}`, content })),
       ];
       const tarball = packTar(entries);
-      return await gzip(tarball);
+      return await brotliCompress(tarball);
     },
 
     // Inverse of pack: decompress + extract. Returns the manifest object and
@@ -269,7 +565,7 @@ export function createBackupPackagerService() {
     }: {
       archive: Buffer;
     }): Promise<{ manifest: object; files: Map<string, Buffer> }> {
-      const tarball = await gunzip(archive);
+      const tarball = await decompressArchive(archive);
       const entries = unpackTar(tarball);
 
       const manifestEntry = entries.find((e) => e.name === 'manifest.json');
@@ -294,17 +590,17 @@ export function createBackupPackagerService() {
   };
 }
 
-async function gzip(input: Buffer): Promise<Buffer> {
-  // Wrap the entire pipeline in a Promise resolved by consuming the gzip stream
-  // and concatenating chunks. Cleaner than the original pipeline+sink idiom and
-  // works in any Node version.
+async function brotliCompress(input: Buffer): Promise<Buffer> {
+  // Wrap the entire pipeline in a Promise resolved by consuming the brotli
+  // stream and concatenating chunks. Cleaner than the original pipeline+sink
+  // idiom and works in any Node version.
   const chunks: Buffer[] = [];
   await new Promise<void>((resolve, reject) => {
-    const gzip = createGzip();
-    gzip.on('data', (chunk: Buffer) => chunks.push(chunk));
-    gzip.on('end', resolve);
-    gzip.on('error', reject);
-    Readable.from(input).on('error', reject).pipe(gzip);
+    const brotli = createBrotliCompress(BROTLI_OPTIONS);
+    brotli.on('data', (chunk: Buffer) => chunks.push(chunk));
+    brotli.on('end', resolve);
+    brotli.on('error', reject);
+    Readable.from(input).on('error', reject).pipe(brotli);
   });
   return Buffer.concat(chunks);
 }
@@ -319,6 +615,27 @@ async function gunzip(input: Buffer): Promise<Buffer> {
     Readable.from(input).on('error', reject).pipe(gunzip);
   });
   return Buffer.concat(chunks);
+}
+
+async function brotliDecompress(input: Buffer): Promise<Buffer> {
+  const chunks: Buffer[] = [];
+  await new Promise<void>((resolve, reject) => {
+    const brotli = createBrotliDecompress();
+    brotli.on('data', (chunk: Buffer) => chunks.push(chunk));
+    brotli.on('end', resolve);
+    brotli.on('error', reject);
+    Readable.from(input).on('error', reject).pipe(brotli);
+  });
+  return Buffer.concat(chunks);
+}
+
+// Backups created before this change are gzip; new ones are brotli. Gzip
+// streams always start with the 2-byte magic number 0x1f8b, so we can tell
+// them apart without a format version field and stay backward compatible with
+// every backup file already sitting in someone's Google Drive/WebDAV/FTP.
+async function decompressArchive(input: Buffer): Promise<Buffer> {
+  const isGzip = input.length >= 2 && input.subarray(0, 2).equals(GZIP_MAGIC);
+  return isGzip ? await gunzip(input) : await brotliDecompress(input);
 }
 
 export type BackupPackagerService = ReturnType<typeof createBackupPackagerService>;
